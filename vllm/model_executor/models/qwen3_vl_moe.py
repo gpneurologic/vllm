@@ -217,7 +217,6 @@ class Qwen3VLMoeForConditionalGeneration(
 
         self.config = config
         self.model_config = vllm_config.model_config
-        self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.video_pruning_rate = multimodal_config.video_pruning_rate

@@ -918,7 +918,7 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
 
         if self.tokenizer is not None:
             maybe_make_thread_pool(
-                self.tokenizer, config.model_config.renderer_num_workers + 1
+                self.tokenizer, config.model_config.renderer_num_workers
             )
 
     def _can_produce_offsets(self) -> bool:
