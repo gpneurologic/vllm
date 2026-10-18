@@ -44,6 +44,11 @@ _debug_graph_captures = 0
 _DEBUG_GRAPH_VERIFY = int(__import__("os").environ.get("VLLM_DEBUG_GRAPH_VERIFY", "0"))
 _debug_graph_verify_counts: Counter = Counter()
 
+# Debug: synchronize the device right before and after every graph replay
+# (VLLM_DEBUG_GRAPH_SYNC=1), to test for a missing ordering between a replay
+# and the eager work around it (filling its inputs, reading its outputs).
+_DEBUG_GRAPH_SYNC = __import__("os").environ.get("VLLM_DEBUG_GRAPH_SYNC") == "1"
+
 
 def _flatten_tensors(x) -> list:
     if isinstance(x, torch.Tensor):
@@ -475,7 +480,11 @@ class CUDAGraphWrapper:
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
+        if _DEBUG_GRAPH_SYNC:
+            torch.accelerator.synchronize()
         entry.cudagraph.replay()
+        if _DEBUG_GRAPH_SYNC:
+            torch.accelerator.synchronize()
         if verify:
             try:
                 eager_out = self.runnable(*verify_args, **kwargs)
