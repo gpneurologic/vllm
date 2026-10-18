@@ -71,6 +71,13 @@ logger = init_logger(__name__)
 _DEBUG_DRAFT = int(os.environ.get("VLLM_DEBUG_DRAFT", "0"))
 _debug_draft_steps = 0
 
+# Debug: pad draft steps 2+ to at least N rows even without graphs
+# (VLLM_DEBUG_DRAFT_PAD=N), to test whether padding alone changes the real
+# rows. VLLM_DEBUG_DRAFT_PAD_FILL=zero|copy|stale sets the padding rows'
+# input ids, positions and hidden states (stale: leave the buffers as is).
+_DEBUG_DRAFT_PAD = int(os.environ.get("VLLM_DEBUG_DRAFT_PAD", "0"))
+_DEBUG_DRAFT_PAD_FILL = os.environ.get("VLLM_DEBUG_DRAFT_PAD_FILL", "stale")
+
 
 def _debug_draft_log(step: int, mode, batch_size: int, input_tokens: int, **tensors):
     global _debug_draft_steps
@@ -715,6 +722,8 @@ class SpecDecodeBaseProposer:
         cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
             self._determine_batch_execution_and_padding(batch_size)
         )
+        if _DEBUG_DRAFT_PAD > input_batch_size:
+            input_batch_size = _DEBUG_DRAFT_PAD
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -794,6 +803,17 @@ class SpecDecodeBaseProposer:
                     inputs_embeds = None
                 model_hidden_states = self.hidden_states[:input_batch_size]
                 model_input_tokens = input_batch_size
+                if _DEBUG_DRAFT_PAD and input_batch_size > batch_size:
+                    pad = slice(batch_size, input_batch_size)
+                    if _DEBUG_DRAFT_PAD_FILL == "zero":
+                        self.input_ids[pad] = 0
+                        self.hidden_states[pad] = 0
+                        self._get_positions(input_batch_size)[..., pad] = 0
+                    elif _DEBUG_DRAFT_PAD_FILL == "copy":
+                        self.input_ids[pad] = self.input_ids[:1]
+                        self.hidden_states[pad] = self.hidden_states[:1]
+                        pos = self._get_positions(input_batch_size)
+                        pos[..., pad] = pos[..., :1]
 
             # Run the model.
             model_kwargs = {
