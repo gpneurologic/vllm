@@ -99,3 +99,49 @@ __all__ = [
     "initialize_ray_cluster",
     "PoolingParams",
 ]
+
+
+# Debug: with VLLM_DEBUG_MALLOC_TRIM=1, every vLLM process installs a SIGUSR2
+# handler that prints its memory, calls glibc malloc_trim(0) to hand freed
+# heap back to the OS, and prints its memory again. Measures how much of a
+# process's memory is freed-but-held heap.
+def _install_malloc_trim_debug_handler() -> None:
+    import os
+
+    if os.environ.get("VLLM_DEBUG_MALLOC_TRIM") != "1":
+        return
+    import ctypes
+    import signal
+    import sys
+
+    def _mem() -> str:
+        fields = {}
+        with open(f"/proc/{os.getpid()}/status") as f:
+            for line in f:
+                key = line.split(":")[0]
+                if key in ("RssAnon", "VmSwap"):
+                    fields[key] = int(line.split()[1]) // 1024
+        return f"anon={fields.get('RssAnon', 0)} MB swap={fields.get('VmSwap', 0)} MB"
+
+    def _handler(signum, frame) -> None:
+        try:
+            with open(f"/proc/{os.getpid()}/comm") as f:
+                name = f.read().strip()
+            before = _mem()
+            freed = ctypes.CDLL("libc.so.6").malloc_trim(0)
+            print(
+                f"[malloc-trim] pid={os.getpid()} {name} before: {before} "
+                f"after: {_mem()} (malloc_trim returned {freed})",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as e:  # never let instrumentation break a run
+            print(f"[malloc-trim] failed: {e}", file=sys.stderr, flush=True)
+
+    try:
+        signal.signal(signal.SIGUSR2, _handler)
+    except ValueError:
+        pass  # not the main thread
+
+
+_install_malloc_trim_debug_handler()
