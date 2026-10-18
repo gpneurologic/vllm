@@ -145,3 +145,80 @@ def _install_malloc_trim_debug_handler() -> None:
 
 
 _install_malloc_trim_debug_handler()
+
+
+# Debug: with VLLM_DEBUG_MEM_REPORT=1, every vLLM process installs a SIGUSR1
+# handler that prints where its memory is: private RSS, Python allocations by
+# file (if PYTHONTRACEMALLOC is set), and all live CPU torch tensors.
+def _install_mem_report_debug_handler() -> None:
+    import os
+
+    if os.environ.get("VLLM_DEBUG_MEM_REPORT") != "1":
+        return
+    import signal
+    import sys
+
+    def _handler(signum, frame) -> None:
+        out = []
+        try:
+            pid = os.getpid()
+            with open(f"/proc/{pid}/comm") as f:
+                name = f.read().strip()
+            anon = 0
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("RssAnon:"):
+                        anon = int(line.split()[1]) // 1024
+            out.append(f"[mem-report] pid={pid} {name} RssAnon={anon} MB")
+
+            import tracemalloc
+
+            if tracemalloc.is_tracing():
+                snap = tracemalloc.take_snapshot()
+                stats = snap.statistics("filename")
+                total = sum(st.size for st in stats) / 2**20
+                out.append(f"[mem-report]   python (tracemalloc) total={total:.0f} MB, top files:")
+                for st in stats[:15]:
+                    out.append(
+                        f"[mem-report]     {st.size / 2**20:7.1f} MB {st.count:8d} blocks  "
+                        f"{st.traceback[0].filename}"
+                    )
+
+            import gc
+
+            import torch
+
+            seen = {}
+            for obj in gc.get_objects():
+                try:
+                    if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
+                        continue
+                    st = obj.untyped_storage()
+                    key = st.data_ptr()
+                    if key == 0 or key in seen:
+                        continue
+                    seen[key] = (st.nbytes(), obj.is_pinned(), tuple(obj.shape), str(obj.dtype))
+                except Exception:
+                    continue
+            tot = sum(v[0] for v in seen.values()) / 2**20
+            pinned = sum(v[0] for v in seen.values() if v[1]) / 2**20
+            out.append(
+                f"[mem-report]   CPU torch tensors: {len(seen)} storages, "
+                f"{tot:.0f} MB total, {pinned:.0f} MB pinned; largest:"
+            )
+            for nbytes, pin, shape, dtype in sorted(seen.values(), reverse=True)[:12]:
+                out.append(
+                    f"[mem-report]     {nbytes / 2**20:8.1f} MB {'pinned' if pin else '      '} "
+                    f"{dtype} {shape}"
+                )
+        except Exception as e:  # never let instrumentation break a run
+            out.append(f"[mem-report] failed: {e}")
+        print("\n".join(out), file=sys.stderr, flush=True)
+
+    try:
+        signal.signal(signal.SIGUSR1, _handler)
+    except ValueError:
+        pass  # not the main thread
+
+
+_install_mem_report_debug_handler()
