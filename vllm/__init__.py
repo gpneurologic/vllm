@@ -150,8 +150,10 @@ _install_malloc_trim_debug_handler()
 # Debug: with VLLM_DEBUG_MEM_REPORT=1, every vLLM process installs a SIGUSR1
 # handler that prints where its memory is: private RSS; glibc malloc arenas,
 # free bytes and malloc's own large mmaps (malloc_info); a size histogram of
-# anonymous memory regions; Python allocations by file (if PYTHONTRACEMALLOC
-# is set); and live CPU torch tensors plus the pinned host-memory pool.
+# anonymous memory regions; live CPU torch tensors plus the pinned host-memory
+# pool; pymalloc arenas and gc-tracked Python objects by type; Python
+# allocations by package and file (if PYTHONTRACEMALLOC is set); and, last, how
+# much a gc.collect() past vLLM's gc.freeze() frees (the heap is re-frozen).
 def _install_mem_report_debug_handler() -> None:
     import os
 
@@ -258,6 +260,89 @@ def _install_mem_report_debug_handler() -> None:
             except Exception:
                 continue
 
+    def _pymalloc_mb() -> float:
+        # pymalloc's arenas come from mmap, so malloc tracing misses them
+        import re as _re
+        import tempfile
+
+        saved = os.dup(2)
+        with tempfile.TemporaryFile() as tmp:
+            os.dup2(tmp.fileno(), 2)
+            try:
+                sys._debugmallocstats()
+            finally:
+                os.dup2(saved, 2)
+                os.close(saved)
+            tmp.seek(0)
+            stats = tmp.read().decode(errors="replace")
+        m = _re.search(r"# arenas allocated current\s*=\s*([\d,]+)", stats)
+        return int(m.group(1).replace(",", "")) if m else -1  # 1 MiB arenas
+
+    def _anon_mb() -> int:
+        with open(f"/proc/{os.getpid()}/status") as f:
+            for line in f:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1]) // 1024
+        return -1
+
+    def _python(out) -> None:
+        import collections
+        import gc
+
+        out.append(f"[mem-report]   pymalloc arenas: {_pymalloc_mb()} MB")
+        # vLLM freezes the heap after startup; frozen objects are hidden from
+        # gc.get_objects(), so unfreeze to count them (and freeze again below)
+        frozen = gc.get_freeze_count()
+        gc.unfreeze()
+        count = collections.Counter()
+        size = collections.Counter()
+        objs = gc.get_objects()
+        for obj in objs:
+            name = type(obj).__name__
+            count[name] += 1
+            try:
+                size[name] += sys.getsizeof(obj)
+            except Exception:
+                pass
+        del objs
+        out.append(f"[mem-report]   python: {len(sys.modules)} modules, {frozen} frozen objects, "
+                   f"{sum(count.values())} gc-tracked objects, {sum(size.values()) / 2**20:.0f} MB "
+                   f"(shallow sizes); by type:")
+        for name, nbytes in size.most_common(15):
+            out.append(f"[mem-report]     {nbytes / 2**20:7.1f} MB  {count[name]:9d}  {name}")
+        tok = {n: c for n, c in count.items() if "Tokenizer" in n}
+        out.append(f"[mem-report]   tokenizer objects: {tok or 'none'}")
+        try:
+            import tracemalloc
+
+            if tracemalloc.is_tracing():
+                stats = tracemalloc.take_snapshot().statistics("filename")
+                by_pkg = collections.Counter()
+                for st in stats:
+                    path = st.traceback[0].filename
+                    for marker in ("site-packages/", "dist-packages/", "/lib/python3.12/"):
+                        if marker in path:
+                            path = path.split(marker, 1)[1]
+                            break
+                    pkg = path.split("/")[0] if "/" in path else path
+                    by_pkg[pkg.removesuffix(".py")] += st.size
+                out.append(f"[mem-report]   tracemalloc: total {sum(by_pkg.values()) / 2**20:.0f} MB;"
+                           " by package:")
+                for pkg, nbytes in by_pkg.most_common(20):
+                    out.append(f"[mem-report]     {nbytes / 2**20:7.1f} MB  {pkg}")
+                out.append("[mem-report]   tracemalloc by file:")
+                for st in stats[:30]:
+                    out.append(f"[mem-report]     {st.size / 2**20:7.1f} MB  {st.traceback[0].filename}")
+        except Exception as e:
+            out.append(f"[mem-report]   tracemalloc failed: {e}")
+        # Is any of it garbage that the freeze kept from being collected?
+        before = (_anon_mb(), _pymalloc_mb())
+        found = gc.collect()
+        after = (_anon_mb(), _pymalloc_mb())
+        gc.freeze()
+        out.append(f"[mem-report]   gc.collect after unfreeze: {found} unreachable objects; "
+                   f"RssAnon {before[0]} -> {after[0]} MB, pymalloc arenas {before[1]} -> {after[1]} MB")
+
     def _handler(signum, frame) -> None:
         out = []
         pid = os.getpid()
@@ -272,22 +357,11 @@ def _install_mem_report_debug_handler() -> None:
             out.append(f"[mem-report] pid={pid} {name} RssAnon={anon} MB")
         except Exception as e:
             out.append(f"[mem-report] header failed: {e}")
-        for part in (_malloc_info, _regions, _tensors):
+        for part in (_malloc_info, _regions, _tensors, _python):
             try:
                 part(out)
             except Exception as e:  # never let instrumentation break a run
                 out.append(f"[mem-report]   {part.__name__} failed: {e}")
-        try:
-            import tracemalloc
-
-            if tracemalloc.is_tracing():
-                stats = tracemalloc.take_snapshot().statistics("filename")
-                out.append(f"[mem-report]   python (tracemalloc) total="
-                           f"{sum(st.size for st in stats) / 2**20:.0f} MB")
-                for st in stats[:12]:
-                    out.append(f"[mem-report]     {st.size / 2**20:7.1f} MB  {st.traceback[0].filename}")
-        except Exception as e:
-            out.append(f"[mem-report]   tracemalloc failed: {e}")
         print("\n".join(out), file=sys.stderr, flush=True)
 
     try:
