@@ -255,6 +255,14 @@ class VocabParallelEmbedding(PluggableLayer):
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
         num_added_embeddings = num_embeddings - self.org_vocab_size
+        # The padded vocab is split evenly across TP ranks. If padding to
+        # `padding_size` doesn't divide by the TP size (e.g. 248320 rows at
+        # TP=3), pad to a multiple of padding_size * tp_size instead.
+        if (
+            pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size
+            or pad_vocab_size(num_embeddings, padding_size) % self.tp_size
+        ):
+            self.padding_size = padding_size * self.tp_size
         self.org_vocab_size_padded = pad_vocab_size(
             self.org_vocab_size, self.padding_size
         )
