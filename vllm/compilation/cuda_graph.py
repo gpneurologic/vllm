@@ -105,7 +105,13 @@ def _debug_graph_verify_log(wrapper, entry, replay_out, eager_out) -> None:
                 continue
             ref = b.float().norm().item()
             d = (a.float() - b.float()).norm().item()
-            diffs.append(f"{tuple(a.shape)}:{d / ref if ref else d:.4g}")
+            # also row-0 norms of replay and eager, to identify each output
+            ra = a[0].float().norm().item() if a.dim() > 0 else 0.0
+            rb = b[0].float().norm().item() if b.dim() > 0 else 0.0
+            diffs.append(
+                f"{tuple(a.shape)}:{d / ref if ref else d:.4g}"
+                f"(r0 replay={ra:.3f} eager={rb:.3f})"
+            )
         logger.info(
             "[graph-verify] wrapper=%x batch=%s replay#=%d rel_diff=%s",
             id(wrapper),
