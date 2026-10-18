@@ -30,10 +30,11 @@ def _debug_log_all_reduce(input_: torch.Tensor, output: torch.Tensor) -> None:
     try:
         import sys
 
-        # communicator.all_reduce <- GroupCoordinator._all_reduce_out_place <-
+        # _debug_log_all_reduce <- communicator.all_reduce <-
+        # GroupCoordinator._all_reduce_out_place <-
         # either the vllm::all_reduce custom op ("all_reduce") or the direct
         # eager call ("GroupCoordinator.all_reduce").
-        caller = sys._getframe(2).f_code.co_qualname
+        caller = sys._getframe(3).f_code.co_qualname
         logger.info(
             "[allreduce-debug] call=%d caller=%s shape=%s dtype=%s "
             "returns_input=%s compiling=%s capturing=%s",
