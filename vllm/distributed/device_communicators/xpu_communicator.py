@@ -16,6 +16,38 @@ logger = init_logger(__name__)
 _SKIP_ALL_REDUCE = os.environ.get("SKIP_ALL_REDUCE") == "1"
 _INPLACE_ALL_REDUCE = os.environ.get("VLLM_XPU_INPLACE_ALLREDUCE", "1") == "1"
 
+# Debug: log the first N all-reduce calls per process (metadata only; no
+# device sync or allocation, so it is safe during graph capture).
+_DEBUG_ALL_REDUCE = int(os.environ.get("VLLM_XPU_DEBUG_ALLREDUCE", "0"))
+_debug_all_reduce_calls = 0
+
+
+def _debug_log_all_reduce(input_: torch.Tensor, output: torch.Tensor) -> None:
+    global _debug_all_reduce_calls
+    _debug_all_reduce_calls += 1
+    if _debug_all_reduce_calls > _DEBUG_ALL_REDUCE:
+        return
+    try:
+        import sys
+
+        # communicator.all_reduce <- GroupCoordinator._all_reduce_out_place <-
+        # either the vllm::all_reduce custom op ("all_reduce") or the direct
+        # eager call ("GroupCoordinator.all_reduce").
+        caller = sys._getframe(2).f_code.co_qualname
+        logger.info(
+            "[allreduce-debug] call=%d caller=%s shape=%s dtype=%s "
+            "returns_input=%s compiling=%s capturing=%s",
+            _debug_all_reduce_calls,
+            caller,
+            tuple(input_.shape),
+            input_.dtype,
+            output is input_,
+            torch.compiler.is_compiling(),
+            torch.xpu.is_current_stream_capturing(),
+        )
+    except Exception as e:  # never let instrumentation break a run
+        logger.info("[allreduce-debug] logging failed: %s", e)
+
 
 class XpuCommunicator(DeviceCommunicatorBase):
     def __init__(
@@ -71,6 +103,8 @@ class XpuCommunicator(DeviceCommunicatorBase):
             work = self.device_group.allreduce([output], self._allreduce_options)
             if work is not None:
                 work.wait()
+        if _DEBUG_ALL_REDUCE:
+            _debug_log_all_reduce(input_, output)
         return output
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
