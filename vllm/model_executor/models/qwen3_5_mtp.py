@@ -12,7 +12,8 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -93,15 +94,28 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             if (quant_config and quant_config.get_name() == "modelopt_fp4")
             else quant_config
         )
-        self.fc = ColumnParallelLinear(
-            self.config.hidden_size * 2,
-            self.config.hidden_size,
-            gather_output=True,
-            bias=False,
-            return_bias=False,
-            quant_config=fc_quant,
-            prefix=f"{prefix}.fc",
-        )
+        if self.config.hidden_size % get_tensor_model_parallel_world_size() == 0:
+            self.fc = ColumnParallelLinear(
+                self.config.hidden_size * 2,
+                self.config.hidden_size,
+                gather_output=True,
+                bias=False,
+                return_bias=False,
+                quant_config=fc_quant,
+                prefix=f"{prefix}.fc",
+            )
+        else:
+            # The output can't be split evenly (e.g. hidden 5120 at TP=3, with a
+            # checkpoint padded for TP=3); the gathered result is the same, so
+            # keep this one small layer whole on every card.
+            self.fc = ReplicatedLinear(
+                self.config.hidden_size * 2,
+                self.config.hidden_size,
+                bias=False,
+                return_bias=False,
+                quant_config=fc_quant,
+                prefix=f"{prefix}.fc",
+            )
 
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
