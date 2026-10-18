@@ -451,20 +451,35 @@ class CUDAGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
+        # Only PIECEWISE pieces: they exclude attention and recurrent-state
+        # ops, so running one twice has no side effects. A FULL graph would
+        # write the KV cache and advance recurrent state a second time.
         verify = (
             _DEBUG_GRAPH_VERIFY
+            and self.runtime_mode == CUDAGraphMode.PIECEWISE
             and _debug_graph_verify_counts[id(self)] < _DEBUG_GRAPH_VERIFY
         )
         if verify:
             _debug_graph_verify_counts[id(self)] += 1
-            # clone before replay: a piece may update its inputs in place
-            verify_args = [a.clone() if isinstance(a, torch.Tensor) else a for a in args]
+            # copy before replay (a piece may update its inputs in place),
+            # keeping each input's strides: compiled pieces check them
+            verify_args = [
+                torch.empty_strided(
+                    a.size(), a.stride(), dtype=a.dtype, device=a.device
+                ).copy_(a)
+                if isinstance(a, torch.Tensor)
+                else a
+                for a in args
+            ]
 
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
         if verify:
-            eager_out = self.runnable(*verify_args, **kwargs)
-            _debug_graph_verify_log(self, entry, entry.output, eager_out)
+            try:
+                eager_out = self.runnable(*verify_args, **kwargs)
+                _debug_graph_verify_log(self, entry, entry.output, eager_out)
+            except Exception as e:  # never let instrumentation break a run
+                logger.info("[graph-verify] eager re-run failed: %s", e)
         return entry.output
