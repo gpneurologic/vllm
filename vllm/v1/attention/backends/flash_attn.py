@@ -1827,3 +1827,82 @@ def cascade_attention(
 
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
+
+
+# Debug: log the MTP drafter's attention calls (VLLM_DEBUG_ATTN=N, first N
+# calls per process): metadata, q/k/v rows, the KV cache at earlier
+# positions, and the output rows. Syncs the device; skipped during graph
+# capture. Only layers whose name contains "mtp".
+_DEBUG_ATTN = int(os.environ.get("VLLM_DEBUG_ATTN", "0"))
+_debug_attn_calls = 0
+
+
+def _debug_attn_should_log(layer) -> bool:
+    if not _DEBUG_ATTN or _debug_attn_calls >= _DEBUG_ATTN:
+        return False
+    if "mtp" not in getattr(layer, "layer_name", ""):
+        return False
+    return not (torch.xpu.is_available() and torch.xpu.is_current_stream_capturing())
+
+
+def _debug_rows(t: torch.Tensor, n: int) -> list:
+    return [round(v, 3) for v in t[:n].reshape(n, -1).float().norm(dim=1).tolist()]
+
+
+if _DEBUG_ATTN:
+    _orig_fa_forward = FlashAttentionImpl.forward
+    _orig_fa_kv_update = FlashAttentionImpl.do_kv_cache_update
+
+    def _debug_fa_forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                          output, *args, **kwargs):
+        log = attn_metadata is not None and _debug_attn_should_log(layer)
+        if log:
+            try:
+                md = attn_metadata
+                n = md.num_actual_tokens
+                bs = kv_cache.shape[2]
+                seq_lens = md.seq_lens.tolist()
+                bt = md.block_table[:, :2].tolist()
+                # key cache rows of earlier positions of request 0
+                kc, vc = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+                prev = []
+                for pos in range(max(0, seq_lens[0] - 3), seq_lens[0]):
+                    blk = md.block_table[0, pos // bs].item()
+                    prev.append(round(kc[blk, pos % bs].float().norm().item(), 3))
+                pre = (
+                    f"rows={query.shape[0]} n_actual={n} max_q={md.max_query_len} "
+                    f"qsl={md.query_start_loc.tolist()} seq_lens={seq_lens} "
+                    f"max_seq={md.max_seq_len} bt={bt} slots={md.slot_mapping.tolist()} "
+                    f"q={_debug_rows(query, n)} k={_debug_rows(key, n)} "
+                    f"v={_debug_rows(value, n)} q_stride={tuple(query.stride())} "
+                    f"kcache_prev={prev}"
+                )
+            except Exception as e:
+                pre = f"pre-log failed: {e}"
+        out = _orig_fa_forward(self, layer, query, key, value, kv_cache,
+                               attn_metadata, output, *args, **kwargs)
+        if log:
+            global _debug_attn_calls
+            _debug_attn_calls += 1
+            try:
+                post = f"out={_debug_rows(output, attn_metadata.num_actual_tokens)}"
+            except Exception as e:
+                post = f"post-log failed: {e}"
+            logger.info("[attn-debug] n=%d layer=%s %s %s", _debug_attn_calls,
+                        layer.layer_name, pre, post)
+        return out
+
+    def _debug_fa_kv_update(self, layer, key, value, kv_cache, slot_mapping):
+        if _debug_attn_should_log(layer):
+            try:
+                logger.info(
+                    "[attn-debug] kv-update layer=%s rows=%d slots=%s k=%s",
+                    layer.layer_name, key.shape[0], slot_mapping.tolist(),
+                    _debug_rows(key, key.shape[0]),
+                )
+            except Exception as e:
+                logger.info("[attn-debug] kv-update log failed: %s", e)
+        return _orig_fa_kv_update(self, layer, key, value, kv_cache, slot_mapping)
+
+    FlashAttentionImpl.forward = _debug_fa_forward
+    FlashAttentionImpl.do_kv_cache_update = _debug_fa_kv_update
