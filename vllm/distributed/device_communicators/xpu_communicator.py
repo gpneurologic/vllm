@@ -81,16 +81,21 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
                 logger.info("Using AgRs manager on XPU device.")
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        # Default to in-place all-reduce: it avoids a redundant device clone
-        # on every collective and measurably improves eager decode TPOT.
-        # torch.compile still clones by default (matches the upstream
-        # all-zero-under-compile accuracy fix); set
-        # VLLM_XPU_INPLACE_ALLREDUCE=0 to force the out-of-place path if a
-        # future issue is suspected.
+    def all_reduce(
+        self, input_: torch.Tensor, allow_inplace: bool = False
+    ) -> torch.Tensor:
+        # In-place all-reduce avoids a device clone per collective and
+        # improves eager decode TPOT, but only direct eager callers may opt in
+        # (allow_inplace=True). Calls through the vllm::all_reduce custom op
+        # (compiled code and graph capture) must return a new tensor: the op
+        # is declared functional, and returning the input lets Inductor reuse
+        # its buffer and overwrite the result. torch.compiler.is_compiling()
+        # cannot detect those calls: it is only true while tracing.
+        # VLLM_XPU_INPLACE_ALLREDUCE=0 disables in-place everywhere.
         output = (
             input_
-            if not _SKIP_ALL_REDUCE
+            if allow_inplace
+            and not _SKIP_ALL_REDUCE
             and _INPLACE_ALL_REDUCE
             and not torch.compiler.is_compiling()
             else input_.clone()

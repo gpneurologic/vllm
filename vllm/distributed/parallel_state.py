@@ -666,11 +666,19 @@ class GroupCoordinator:
         if use_custom_op:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
-            return self._all_reduce_out_place(input_)
+            # XPU's direct eager call may reduce in place; the custom op path
+            # above must not (see XpuCommunicator.all_reduce).
+            return self._all_reduce_out_place(
+                input_, allow_inplace=self.bypass_custom_all_reduce_in_eager
+            )
 
-    def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+    def _all_reduce_out_place(
+        self, input_: torch.Tensor, allow_inplace: bool = False
+    ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        if allow_inplace:
+            return self.device_communicator.all_reduce(input_, allow_inplace=True)
         return self.device_communicator.all_reduce(input_)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
