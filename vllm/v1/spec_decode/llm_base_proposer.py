@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import os
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -63,6 +64,46 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+# Debug: log the inputs and outputs of the first N draft steps per process
+# (VLLM_DEBUG_DRAFT=N). Copies small tensors to the host, so it syncs the
+# device; never runs while a graph is being captured.
+_DEBUG_DRAFT = int(os.environ.get("VLLM_DEBUG_DRAFT", "0"))
+_debug_draft_steps = 0
+
+
+def _debug_draft_log(step: int, mode, batch_size: int, input_tokens: int, **tensors):
+    global _debug_draft_steps
+    if _debug_draft_steps >= _DEBUG_DRAFT:
+        return
+    try:
+        if torch.xpu.is_available() and torch.xpu.is_current_stream_capturing():
+            return
+        _debug_draft_steps += 1
+        parts = []
+        for name, t in tensors.items():
+            if t is None:
+                continue
+            if t.is_floating_point():
+                # per-row L2 norm and first values of the first row
+                rows = t.reshape(t.shape[0], -1).float()
+                parts.append(
+                    f"{name}.norm={[round(v, 3) for v in rows.norm(dim=1).tolist()]} "
+                    f"{name}[0][:4]={[round(v, 4) for v in rows[0, :4].tolist()]}"
+                )
+            else:
+                parts.append(f"{name}={t.tolist()}")
+        logger.info(
+            "[draft-debug] n=%d step=%d mode=%s batch=%d input_tokens=%d %s",
+            _debug_draft_steps,
+            step,
+            getattr(mode, "name", mode),
+            batch_size,
+            input_tokens,
+            " ".join(parts),
+        )
+    except Exception as e:  # never let instrumentation break a run
+        logger.info("[draft-debug] logging failed: %s", e)
 
 
 class SpecDecodeBaseProposer:
@@ -647,6 +688,16 @@ class SpecDecodeBaseProposer:
             sample_hidden_states, sampling_metadata
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
+        if _DEBUG_DRAFT:
+            _debug_draft_log(
+                1,
+                "first-pass",
+                batch_size,
+                batch_size,
+                positions=positions,
+                hidden=hidden_states,
+                out_token=draft_token_ids,
+            )
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -778,6 +829,20 @@ class SpecDecodeBaseProposer:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 last_hidden_states[:batch_size], sampling_metadata
             )
+            if _DEBUG_DRAFT:
+                _debug_draft_log(
+                    token_index + 2,
+                    cudagraph_runtime_mode,
+                    batch_size,
+                    model_input_tokens,
+                    in_ids=model_kwargs["input_ids"],
+                    in_pos=model_kwargs["positions"],
+                    in_hidden=model_kwargs.get("hidden_states"),
+                    slots=self._slot_mapping_buffer[:model_input_tokens],
+                    seq_lens=common_attn_metadata.seq_lens[:batch_size],
+                    out_hidden=hidden_states,
+                    out_token=draft_token_ids,
+                )
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
