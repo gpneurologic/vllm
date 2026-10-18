@@ -113,6 +113,23 @@ def _debug_draft_log(step: int, mode, batch_size: int, input_tokens: int, **tens
         logger.info("[draft-debug] logging failed: %s", e)
 
 
+_DEBUG_GRAPH_ARGS = int(os.environ.get("VLLM_DEBUG_GRAPH_ARGS", "0"))
+
+
+def _debug_args_on() -> None:
+    if _DEBUG_GRAPH_ARGS:
+        import vllm.compilation.cuda_graph as cg
+
+        cg.debug_args_active = True
+
+
+def _debug_args_off() -> None:
+    if _DEBUG_GRAPH_ARGS:
+        import vllm.compilation.cuda_graph as cg
+
+        cg.debug_args_active = False
+
+
 class SpecDecodeBaseProposer:
     def __init__(
         self,
@@ -640,7 +657,9 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
+            _debug_args_on()
             ret_hidden_states = self.model(**model_kwargs)
+            _debug_args_off()
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -838,7 +857,9 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(model_input_tokens),
             ):
+                _debug_args_on()
                 ret_hidden_states = self.model(**model_kwargs)
+                _debug_args_off()
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states

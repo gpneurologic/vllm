@@ -49,6 +49,44 @@ _debug_graph_verify_counts: Counter = Counter()
 # and the eager work around it (filling its inputs, reading its outputs).
 _DEBUG_GRAPH_SYNC = __import__("os").environ.get("VLLM_DEBUG_GRAPH_SYNC") == "1"
 
+# Debug: log the tensor arguments of graph-wrapped pieces while the MTP
+# drafter runs (VLLM_DEBUG_GRAPH_ARGS=N, first N piece calls), in graph and
+# non-graph mode alike. The proposer sets debug_args_active around its
+# model calls. Syncs the device.
+_DEBUG_GRAPH_ARGS = int(__import__("os").environ.get("VLLM_DEBUG_GRAPH_ARGS", "0"))
+debug_args_active = False
+_debug_graph_args_calls = 0
+
+
+def _debug_graph_args_log(wrapper, mode, args) -> None:
+    global _debug_graph_args_calls
+    if _debug_graph_args_calls >= _DEBUG_GRAPH_ARGS:
+        return
+    _debug_graph_args_calls += 1
+    try:
+        parts = []
+        for i, a in enumerate(args):
+            if not isinstance(a, torch.Tensor):
+                parts.append(f"{i}:{type(a).__name__}={a!r}"[:60])
+                continue
+            if a.dim() == 0 or a.numel() == 0:
+                parts.append(f"{i}:{tuple(a.shape)}")
+                continue
+            row0 = a[0].float() if a.dim() > 1 else a[:1].float()
+            if a.is_floating_point():
+                parts.append(f"{i}:{tuple(a.shape)} r0norm={row0.norm().item():.4f}")
+            else:
+                parts.append(f"{i}:{tuple(a.shape)} r0={a[0].reshape(-1)[:4].tolist()}")
+        logger.info(
+            "[graph-args] n=%d wrapper=%x mode=%s %s",
+            _debug_graph_args_calls,
+            id(wrapper),
+            getattr(mode, "name", mode),
+            " | ".join(parts),
+        )
+    except Exception as e:  # never let instrumentation break a run
+        logger.info("[graph-args] logging failed: %s", e)
+
 
 def _flatten_tensors(x) -> list:
     if isinstance(x, torch.Tensor):
@@ -290,6 +328,11 @@ class CUDAGraphWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+
+        if _DEBUG_GRAPH_ARGS and debug_args_active and not (
+            torch.xpu.is_available() and torch.xpu.is_current_stream_capturing()
+        ):
+            _debug_graph_args_log(self, cudagraph_runtime_mode, args)
 
         if (
             cudagraph_runtime_mode == CUDAGraphMode.NONE
