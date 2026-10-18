@@ -55,6 +55,14 @@ _DEBUG_GRAPH_SYNC = __import__("os").environ.get("VLLM_DEBUG_GRAPH_SYNC") == "1"
 # model calls. Syncs the device.
 _DEBUG_GRAPH_ARGS = int(__import__("os").environ.get("VLLM_DEBUG_GRAPH_ARGS", "0"))
 debug_args_active = False
+
+# Debug: capture the MTP drafter's graphs in their own memory pool instead of
+# the global one shared with the target model (VLLM_DEBUG_DRAFTER_POOL=1).
+# Tests whether drafter replays overwrite target-model graph outputs that are
+# still in use. The proposer sets debug_drafter_capturing during capture.
+_DEBUG_DRAFTER_POOL = __import__("os").environ.get("VLLM_DEBUG_DRAFTER_POOL") == "1"
+debug_drafter_capturing = False
+_debug_drafter_pool = None
 _debug_graph_args_calls = 0
 
 
@@ -411,6 +419,13 @@ class CUDAGraphWrapper:
                             lambda *args, **kwargs: None,
                         )
                     )
+
+                if _DEBUG_DRAFTER_POOL and debug_drafter_capturing:
+                    global _debug_drafter_pool
+                    if _debug_drafter_pool is None:
+                        _debug_drafter_pool = current_platform.graph_pool_handle()
+                        logger.info("[drafter-pool] drafter graphs get their own pool")
+                    self.graph_pool = _debug_drafter_pool
 
                 if self.graph_pool is not None:
                     set_graph_pool_id(self.graph_pool)

@@ -114,6 +114,7 @@ def _debug_draft_log(step: int, mode, batch_size: int, input_tokens: int, **tens
 
 
 _DEBUG_GRAPH_ARGS = int(os.environ.get("VLLM_DEBUG_GRAPH_ARGS", "0"))
+_DEBUG_DRAFTER_POOL = os.environ.get("VLLM_DEBUG_DRAFTER_POOL") == "1"
 
 
 def _debug_args_on() -> None:
@@ -1799,7 +1800,16 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
-                self.model(**kwargs)
+                if _DEBUG_DRAFTER_POOL and is_graph_capturing:
+                    import vllm.compilation.cuda_graph as cg
+
+                    cg.debug_drafter_capturing = True
+                    try:
+                        self.model(**kwargs)
+                    finally:
+                        cg.debug_drafter_capturing = False
+                else:
+                    self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """
