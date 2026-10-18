@@ -1719,6 +1719,12 @@ class Qwen3VLForConditionalGeneration(
 
         raise ValueError("Only image or video modality is supported")
 
+    @property
+    def _tokenizer(self):
+        # Loaded on first use (video inputs only), so a text-only worker
+        # doesn't hold a tokenizer it never uses.
+        return cached_tokenizer_from_config(self.model_config)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         super().__init__()
         config: Qwen3VLConfig = vllm_config.model_config.hf_config
@@ -1727,7 +1733,6 @@ class Qwen3VLForConditionalGeneration(
 
         self.config = config
         self.model_config = vllm_config.model_config
-        self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.video_pruning_rate = multimodal_config.video_pruning_rate
