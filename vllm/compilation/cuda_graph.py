@@ -28,6 +28,14 @@ from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
 
+# Debug: on replay, compare each graph's tensor input addresses with the ones
+# recorded at capture and log mismatches (VLLM_DEBUG_GRAPH_ADDR=1). Unlike
+# VLLM_LOGGING_LEVEL=DEBUG this logs instead of asserting, once per
+# (graph, input), and does not turn on debug logging everywhere.
+_DEBUG_GRAPH_ADDR = __import__("os").environ.get("VLLM_DEBUG_GRAPH_ADDR") == "1"
+_debug_graph_addr_seen: set = set()
+_debug_graph_addr_checks = 0
+
 
 @dataclasses.dataclass(frozen=True)
 class CUDAGraphStat:
@@ -280,6 +288,16 @@ class CUDAGraphWrapper:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
+            if _DEBUG_GRAPH_ADDR:
+                logger.info(
+                    "[graph-addr-debug] capture wrapper=%x runnable=%s batch=%s "
+                    "tensor_inputs=%d shapes=%s",
+                    id(self),
+                    type(self.runnable).__name__,
+                    entry.batch_descriptor,
+                    len(input_addresses),
+                    [tuple(x.shape) for x in args if isinstance(x, torch.Tensor)][:6],
+                )
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -342,6 +360,45 @@ class CUDAGraphWrapper:
             # the weak ref of the output, so that pytorch can correctly
             # manage the memory during cuda graph capture
             return output
+
+        if _DEBUG_GRAPH_ADDR and entry.input_addresses is not None:
+            global _debug_graph_addr_checks
+            _debug_graph_addr_checks += 1
+            if _debug_graph_addr_checks == 1:
+                logger.info("[graph-addr-debug] replay address check active")
+            tensors = [x for x in args if isinstance(x, torch.Tensor)]
+            for i, (t, want) in enumerate(zip(tensors, entry.input_addresses)):
+                if t.data_ptr() != want:
+                    key = (id(self), entry.batch_descriptor, i)
+                    if key not in _debug_graph_addr_seen:
+                        _debug_graph_addr_seen.add(key)
+                        logger.info(
+                            "[graph-addr-debug] MISMATCH wrapper=%x runnable=%s "
+                            "batch=%s input=%d/%d shape=%s dtype=%s "
+                            "captured=%x now=%x replay#=%d",
+                            id(self),
+                            type(self.runnable).__name__,
+                            entry.batch_descriptor,
+                            i,
+                            len(tensors),
+                            tuple(t.shape),
+                            t.dtype,
+                            want,
+                            t.data_ptr(),
+                            _debug_graph_addr_checks,
+                        )
+            if len(tensors) != len(entry.input_addresses):
+                key = (id(self), entry.batch_descriptor, "count")
+                if key not in _debug_graph_addr_seen:
+                    _debug_graph_addr_seen.add(key)
+                    logger.info(
+                        "[graph-addr-debug] INPUT COUNT wrapper=%x batch=%s "
+                        "captured=%d now=%d",
+                        id(self),
+                        entry.batch_descriptor,
+                        len(entry.input_addresses),
+                        len(tensors),
+                    )
 
         if self.is_debugging_mode:
             # check if the input addresses are the same
