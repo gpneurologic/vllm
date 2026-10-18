@@ -220,7 +220,10 @@ def _install_mem_report_debug_handler() -> None:
         seen = {}
         errors = 0
         for obj in gc.get_objects():
-            if not isinstance(obj, torch.Tensor):
+            try:
+                if not isinstance(obj, torch.Tensor):
+                    continue
+            except Exception:  # e.g. a dead weakref proxy
                 continue
             try:
                 if obj.device.type != "cpu":
