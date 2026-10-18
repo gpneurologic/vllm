@@ -691,7 +691,7 @@ class SpecDecodeBaseProposer:
         if _DEBUG_DRAFT:
             _debug_draft_log(
                 1,
-                "first-pass",
+                f"first-pass/{cudagraph_runtime_mode.name}",
                 batch_size,
                 batch_size,
                 positions=positions,

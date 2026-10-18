@@ -35,6 +35,43 @@ logger = init_logger(__name__)
 _DEBUG_GRAPH_ADDR = __import__("os").environ.get("VLLM_DEBUG_GRAPH_ADDR") == "1"
 _debug_graph_addr_seen: set = set()
 _debug_graph_addr_checks = 0
+_debug_graph_captures = 0
+
+# Debug: for the first N replays of each graph, also run the same compiled
+# piece eagerly on clones of the inputs and log the relative difference of
+# the outputs (VLLM_DEBUG_GRAPH_VERIFY=N). Finds which captured piece
+# replays wrong. Runs every collective in the piece twice on all ranks.
+_DEBUG_GRAPH_VERIFY = int(__import__("os").environ.get("VLLM_DEBUG_GRAPH_VERIFY", "0"))
+_debug_graph_verify_counts: Counter = Counter()
+
+
+def _flatten_tensors(x) -> list:
+    if isinstance(x, torch.Tensor):
+        return [x]
+    if isinstance(x, (list, tuple)):
+        return [t for item in x for t in _flatten_tensors(item)]
+    return []
+
+
+def _debug_graph_verify_log(wrapper, entry, replay_out, eager_out) -> None:
+    try:
+        diffs = []
+        for a, b in zip(_flatten_tensors(replay_out), _flatten_tensors(eager_out)):
+            if a.shape != b.shape or not a.is_floating_point():
+                diffs.append(f"{tuple(a.shape)}:skip")
+                continue
+            ref = b.float().norm().item()
+            d = (a.float() - b.float()).norm().item()
+            diffs.append(f"{tuple(a.shape)}:{d / ref if ref else d:.4g}")
+        logger.info(
+            "[graph-verify] wrapper=%x batch=%s replay#=%d rel_diff=%s",
+            id(wrapper),
+            entry.batch_descriptor,
+            _debug_graph_verify_counts[id(wrapper)],
+            " ".join(diffs),
+        )
+    except Exception as e:  # never let instrumentation break a run
+        logger.info("[graph-verify] logging failed: %s", e)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -288,10 +325,13 @@ class CUDAGraphWrapper:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
-            if _DEBUG_GRAPH_ADDR:
+            if _DEBUG_GRAPH_ADDR or _DEBUG_GRAPH_VERIFY:
+                global _debug_graph_captures
+                _debug_graph_captures += 1
                 logger.info(
-                    "[graph-addr-debug] capture wrapper=%x runnable=%s batch=%s "
+                    "[graph-addr-debug] capture#=%d wrapper=%x runnable=%s batch=%s "
                     "tensor_inputs=%d shapes=%s",
+                    _debug_graph_captures,
                     id(self),
                     type(self.runnable).__name__,
                     entry.batch_descriptor,
@@ -411,8 +451,20 @@ class CUDAGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
+        verify = (
+            _DEBUG_GRAPH_VERIFY
+            and _debug_graph_verify_counts[id(self)] < _DEBUG_GRAPH_VERIFY
+        )
+        if verify:
+            _debug_graph_verify_counts[id(self)] += 1
+            # clone before replay: a piece may update its inputs in place
+            verify_args = [a.clone() if isinstance(a, torch.Tensor) else a for a in args]
+
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
+        if verify:
+            eager_out = self.runnable(*verify_args, **kwargs)
+            _debug_graph_verify_log(self, entry, entry.output, eager_out)
         return entry.output
