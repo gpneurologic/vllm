@@ -111,6 +111,10 @@ class MultiModalRegistry:
             return False
 
         mm_config = model_config.get_multimodal_config()
+        if mm_config.language_model_only:
+            # Every modality limit is 0, so the answer below would be False.
+            # Return early: building the processing info loads a tokenizer.
+            return False
         try:
             info = self._create_processing_info(model_config, tokenizer=None)
         except ValueError:
