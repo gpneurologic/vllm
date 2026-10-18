@@ -3,6 +3,7 @@
 
 import importlib
 import inspect
+import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast, get_args, get_type_hints
 
@@ -205,6 +206,16 @@ def get_processor(
     **kwargs: Any,
 ) -> _P:
     """Load a processor for the given model name via HuggingFace."""
+    if os.environ.get("VLLM_DEBUG_TOKENIZER_LOADS") == "1":
+        # Debug: a processor brings its own tokenizer; log each one built
+        # (cached_get_processor only reaches here on a cache miss).
+        import traceback
+
+        frames = [f"{fr.filename.split('/vllm/', 1)[-1]}:{fr.lineno} {fr.name}"
+                  for fr in traceback.extract_stack()[:-1] if "/vllm/" in fr.filename]
+        logger.warning("[processor-load] pid=%d cls=%s kwargs=%s via %s", os.getpid(),
+                       getattr(processor_cls, "__name__", processor_cls), sorted(kwargs),
+                       " <- ".join(reversed(frames[-8:])))
     if revision is None:
         revision = "main"
     try:

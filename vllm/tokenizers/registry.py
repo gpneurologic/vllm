@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -188,6 +189,17 @@ def get_tokenizer(
     **kwargs,
 ) -> _T:
     """Gets a tokenizer for the given model name via HuggingFace or ModelScope."""
+    if os.environ.get("VLLM_DEBUG_TOKENIZER_LOADS") == "1":
+        # Debug: log every tokenizer actually built (cached_get_tokenizer
+        # only reaches here on a cache miss), with the vLLM frames that asked.
+        import traceback
+
+        with open(f"/proc/{os.getpid()}/comm") as f:
+            comm = f.read().strip()
+        frames = [f"{fr.filename.split('/vllm/', 1)[-1]}:{fr.lineno} {fr.name}"
+                  for fr in traceback.extract_stack()[:-1] if "/vllm/" in fr.filename]
+        logger.warning("[tokenizer-load] pid=%d %s args=%s kwargs=%s via %s", os.getpid(),
+                       comm, args, sorted(kwargs), " <- ".join(reversed(frames[-8:])))
     if envs.VLLM_USE_FASTOKENS:
         # Process-global, idempotent patch that swaps the Rust BPE backend
         # of any HF fast tokenizer loaded afterwards. No-op for non-HF modes.
