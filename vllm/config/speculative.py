@@ -3,6 +3,7 @@
 
 import copy
 import functools
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -696,6 +697,24 @@ class SpeculativeConfig:
                 if self.target_model_config.hf_text_config.model_type == "deepseek_v32":
                     # FIXME(luccafong): cudagraph with v32 MTP is not supported,
                     # remove this when the issue is fixed.
+                    self.enforce_eager = True
+                # FIXME: on XPU, replaying the MTP drafter's graphs breaks the
+                # 2nd and later draft steps (wrong hidden state, ~3% acceptance
+                # of draft token 2 vs ~77% eager; an exact-size graph can hang).
+                # The drafter stays torch.compiled; only its graphs are off.
+                # The target model keeps its graphs. Set
+                # VLLM_XPU_MTP_DRAFTER_GRAPHS=1 to capture them anyway.
+                from vllm.platforms import current_platform
+
+                if (
+                    self.enforce_eager is None
+                    and current_platform.is_xpu()
+                    and os.environ.get("VLLM_XPU_MTP_DRAFTER_GRAPHS") != "1"
+                ):
+                    logger.info(
+                        "XPU: running the MTP drafter without graphs "
+                        "(set VLLM_XPU_MTP_DRAFTER_GRAPHS=1 to capture them)."
+                    )
                     self.enforce_eager = True
                 # use the draft model from the same model:
                 self.model = self.target_model_config.model
