@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 import gc
 import itertools
 import threading
@@ -482,6 +483,25 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
+
+
+# Debug: log the draft tokens when the drafter returns them, when the next
+# step reads them, and after they are scattered into input_ids
+# (VLLM_DEBUG_DRAFT_TOKENS=N, first N events per process). Syncs the device.
+_DEBUG_DRAFT_TOKENS = int(os.environ.get("VLLM_DEBUG_DRAFT_TOKENS", "0"))
+_debug_draft_tokens_events = 0
+
+
+def _debug_draft_tokens_log(what: str, t) -> None:
+    global _debug_draft_tokens_events
+    if not _DEBUG_DRAFT_TOKENS or _debug_draft_tokens_events >= _DEBUG_DRAFT_TOKENS:
+        return
+    _debug_draft_tokens_events += 1
+    try:
+        vals = t.tolist() if torch.is_tensor(t) else t
+        logger.info("[draft-tokens] n=%d %s=%s", _debug_draft_tokens_events, what, vals)
+    except Exception as e:  # never let instrumentation break a run
+        logger.info("[draft-tokens] logging failed: %s", e)
 
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
@@ -1916,11 +1936,15 @@ class GPUModelRunner(
         # because input_ids dtype is torch.int32,
         # so convert draft_token_ids to torch.int32 here.
         draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+        _debug_draft_tokens_log("held", self._draft_token_ids)
 
         self.input_ids.gpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+        )
+        _debug_draft_tokens_log(
+            "scattered", self.input_ids.gpu[draft_tokens_index_tensor]
         )
 
     def _get_encoder_seq_lens(
@@ -4616,6 +4640,7 @@ class GPUModelRunner(
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+                _debug_draft_tokens_log("proposed", self._draft_token_ids)
 
         spec_config = self.speculative_config
         draft_after_bookkeeping = False
