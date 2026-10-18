@@ -757,6 +757,28 @@ class CompressedTensorsConfig(QuantizationConfig):
                 actorder=weight_quant.actorder,
             )
 
+        # On XPU, dynamic per-token W4A8 int must reach CompressedTensorsW4A8Int
+        # (int4 weight type -> XPUW4A8IntLinearKernel, INT8 math). The generic
+        # WNA8Int match below asks for uint4b8 and falls back to W4A16 math.
+        if (
+            current_platform.is_xpu()
+            and input_quant is not None
+            and format
+            in (
+                CompressionFormat.pack_quantized.value,
+                CompressionFormat.int_quantized.value,
+            )
+            and self._is_dynamic_token_w4a8_int(weight_quant, input_quant)
+        ):
+            return CompressedTensorsW4A8Int(
+                num_bits=weight_quant.num_bits,
+                strategy=weight_quant.strategy,
+                group_size=weight_quant.group_size,
+                is_static_input_scheme=False,
+                input_symmetric=input_quant.symmetric,
+                quant_format=format,
+            )
+
         # Must come before the WNA16 check; standard 4/8-bit weight-only (no
         # output-activation scale) still falls through to WNA16.
         if self._is_wNa8o8_int(weight_quant, input_quant, output_quant, format):

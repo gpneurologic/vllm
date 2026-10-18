@@ -185,6 +185,11 @@ class XPUW4A8IntLinearKernel(MPLinearKernel):
         weight_zero_point = torch.tensor([8], dtype=torch.int8, device=device)
         layer.weight_zero_point = Parameter(weight_zero_point, requires_grad=False)
 
+        if layer.weight_packed.dtype == torch.int32:
+            # compressed-tensors pack-quantized: already [out, in/8] int32 with
+            # values offset by 8, lowest nibble first -- the layout built below.
+            return
+
         # weight_packed is [out, in] int8, signed int4 values in [-8, 7]
         w = layer.weight_packed.data  # [out, in]
 

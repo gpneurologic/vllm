@@ -4,6 +4,7 @@
 from collections.abc import Callable
 
 import torch
+from compressed_tensors.config import CompressionFormat
 
 from vllm.distributed.utils import verify_group_size_divides_partition
 from vllm.logger import init_logger
@@ -15,9 +16,11 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
 from vllm.model_executor.parameter import (
+    BasevLLMParameter,
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
+    PackedvLLMParameter,
 )
 from vllm.scalar_type import scalar_types
 
@@ -40,11 +43,16 @@ class CompressedTensorsW4A8Int(CompressedTensorsScheme):
         group_size: int | None = None,
         is_static_input_scheme: bool = False,
         input_symmetric: bool = True,
+        quant_format: str | None = None,
     ):
         self.strategy = strategy
         self.group_size = -1 if group_size is None else group_size
         self.is_static_input_scheme = is_static_input_scheme
         self.input_symmetric = input_symmetric
+        # pack-quantized checkpoints store 8 int4 values per int32 (offset 8,
+        # lowest nibble first); otherwise one int4 value per int8.
+        self.packed = quant_format == CompressionFormat.pack_quantized.value
+        self.num_bits = num_bits
 
         if num_bits not in W4A8_SUPPORTED_TYPES_MAP:
             raise ValueError(
@@ -109,15 +117,39 @@ class CompressedTensorsW4A8Int(CompressedTensorsScheme):
 
         scales_and_zp_size = input_size_per_partition // effective_group_size
 
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=torch.int8
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
+        if self.packed:
+            pack_factor = 32 // self.num_bits
+            weight = PackedvLLMParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // pack_factor,
+                    dtype=torch.int32,
+                ),
+                input_dim=1,
+                output_dim=0,
+                packed_factor=pack_factor,
+                packed_dim=1,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter(
+                "weight_shape",
+                BasevLLMParameter(
+                    data=torch.empty(2, dtype=torch.int64),
+                    weight_loader=weight_loader,
+                ),
+            )
+        else:
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=torch.int8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
 
         weight_scale_args = {
             "weight_loader": weight_loader,
