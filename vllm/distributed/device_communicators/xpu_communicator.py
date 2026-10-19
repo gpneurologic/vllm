@@ -55,6 +55,17 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # all-zero-under-compile accuracy fix); set
         # VLLM_XPU_INPLACE_ALLREDUCE=0 to force the out-of-place path if a
         # future issue is suspected.
+        # oneCCL's ring all-reduce splits a message into world_size equal parts
+        # and hands the remainder to an Arc kernel that throws "We only support
+        # aligned pointer for now" (oneCCL 2021.15). At TP=2 hidden-size tensors
+        # always divide evenly; at TP=3 they usually don't (5120 * tokens).
+        # Reduce a zero-padded copy instead; the padding doesn't change the sum.
+        quantum = self.world_size * 64
+        numel = input_.numel()
+        if numel % quantum and not _SKIP_ALL_REDUCE:
+            padded = input_.new_zeros(numel + (-numel) % quantum)
+            padded[:numel].copy_(input_.reshape(-1))
+            return self.all_reduce(padded)[:numel].view(input_.shape)
         output = (
             input_
             if not _SKIP_ALL_REDUCE
