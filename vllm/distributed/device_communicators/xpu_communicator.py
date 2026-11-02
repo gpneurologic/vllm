@@ -16,6 +16,12 @@ logger = init_logger(__name__)
 _SKIP_ALL_REDUCE = os.environ.get("SKIP_ALL_REDUCE") == "1"
 _INPLACE_ALL_REDUCE = os.environ.get("VLLM_XPU_INPLACE_ALLREDUCE", "1") == "1"
 
+# Opt-in: small all-reduces in the TP group go GPU to GPU over PCIe instead of
+# through oneCCL (see xpu_p2p_all_reduce.py). Messages above the limit, and all
+# other groups, stay on oneCCL.
+_P2P_ALL_REDUCE = os.environ.get("VLLM_XPU_P2P_ALLREDUCE", "0") == "1"
+_P2P_MAX_BYTES = int(os.environ.get("VLLM_XPU_P2P_ALLREDUCE_MAX_BYTES", str(80 * 1024)))
+
 # Debug: log the first N all-reduce calls per process (metadata only; no
 # device sync or allocation, so it is safe during graph capture).
 _DEBUG_ALL_REDUCE = int(os.environ.get("VLLM_XPU_DEBUG_ALLREDUCE", "0"))
@@ -63,6 +69,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
         self._allreduce_options.reduceOp = dist.ReduceOp.SUM
         self._allreduce_options.asyncOp = False
         self.ca_comm: None = None
+        self.p2p_ar = None
+        if _P2P_ALL_REDUCE and "tp" in unique_name and self.world_size > 1:
+            # Collective set-up: every rank of the group must reach this.
+            from .xpu_p2p_all_reduce import XpuP2PAllReduce
+
+            p2p_ar = XpuP2PAllReduce(
+                self.cpu_group, self.device, max_bytes=_P2P_MAX_BYTES
+            )
+            self.p2p_ar = None if p2p_ar.disabled else p2p_ar
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
@@ -97,6 +112,20 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # aligned pointer for now" (oneCCL 2021.15). At TP=2 hidden-size tensors
         # always divide evenly; at TP=3 they usually don't (5120 * tokens).
         # Reduce a zero-padded copy instead; the padding doesn't change the sum.
+        #
+        # Small messages take the P2P path when it is enabled. It handles any
+        # length, so they need no padding. should_use() depends only on shape
+        # and dtype, so all ranks choose the same path.
+        p2p_ar = self.p2p_ar
+        if (
+            p2p_ar is not None
+            and not _SKIP_ALL_REDUCE
+            and not torch.compiler.is_compiling()
+            and p2p_ar.should_use(input_)
+        ):
+            return p2p_ar.all_reduce(
+                input_, inplace=allow_inplace and _INPLACE_ALL_REDUCE
+            )
         quantum = self.world_size * 64
         numel = input_.numel()
         if numel % quantum and not _SKIP_ALL_REDUCE:
@@ -328,3 +357,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
             hidden_states,
             is_sequence_parallel,
         )
+
+    def destroy(self):
+        if self.p2p_ar is not None:
+            self.p2p_ar.close()
+            self.p2p_ar = None
+        super().destroy()
