@@ -5,7 +5,7 @@
 oneCCL costs about 21 us per all-reduce on 3x Arc Pro B70, however small the
 message. Decode all-reduces are only tokens x hidden_size, so that fixed cost
 dominates. This module pushes each rank's data straight into the other GPUs'
-memory and sums it there (about 13 us for 3 tokens at TP=3). Large messages
+memory and sums it there (about 10 us for 1-6 tokens at TP=3). Large messages
 stay on oneCCL. The kernels and the reasons behind their design are in
 csrc/xpu/p2p_all_reduce.cpp and docs/design/xpu_p2p_all_reduce.md.
 
@@ -29,7 +29,7 @@ _DTYPE_CODES = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 _IPC_HANDLE_SIZE = 64
 _ERR_LEN = 512
 
-DEFAULT_MAX_BYTES = 80 * 1024  # ~8 tokens of a 5120-wide fp16 model
+DEFAULT_MAX_BYTES = 140 * 1024  # ~14 tokens of a 5120-wide fp16 model
 
 
 def _load_library() -> ctypes.CDLL:
@@ -154,12 +154,15 @@ class XpuP2PAllReduce:
     def _queue(self) -> int:
         return torch.xpu.current_stream(self.device).sycl_queue
 
-    def should_use(self, inp: torch.Tensor) -> bool:
+    def should_use(self, inp: torch.Tensor, limit: int | None = None) -> bool:
+        """Whether ``inp`` can take this path. ``limit`` (at most max_bytes)
+        lowers the size limit for this call."""
         if self.disabled or inp.dtype not in _DTYPE_CODES:
             return False
         nbytes = inp.numel() * inp.element_size()
+        limit = self.max_bytes if limit is None else min(limit, self.max_bytes)
         # Same answer on every rank: it depends only on shape and dtype.
-        return 0 < nbytes <= self.max_bytes and nbytes % 4 == 0 and inp.is_contiguous()
+        return 0 < nbytes <= limit and nbytes % 4 == 0 and inp.is_contiguous()
 
     def all_reduce(self, inp: torch.Tensor, inplace: bool = False) -> torch.Tensor:
         """Sum ``inp`` over all ranks. Returns ``inp`` itself if ``inplace``."""

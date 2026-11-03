@@ -7,9 +7,12 @@
 //
 // Design, and why (measured on B70, see docs/design/xpu_p2p_all_reduce.md):
 //  * No PCIe atomics between GPUs, so ranks can't sync with flags. Instead each
-//    8-byte store carries 4 bytes of data plus a 32-bit call number ("LL"
-//    protocol). A word is fresh when its call number matches; no ordering or
-//    fences needed.
+//    16-byte store carries 12 bytes of data plus a 32-bit call number in its
+//    last 4 bytes ("LL" protocol). A word is fresh when its call number
+//    matches; no ordering or fences needed. On B70 a 16-byte vector store
+//    arrives in one piece (tested: ~300k calls over all GPU pairs, no tearing;
+//    two separate 8-byte stores do tear). The receiver polls the upper 8
+//    bytes (tag) and then loads the lower 8, both with system-scope atomics.
 //  * Data is pushed into the receiver's memory and polled there with local
 //    system-scope atomic loads. Polling a peer's memory over PCIe doesn't work.
 //  * One kernel storing to two different peers is ~50x slower than storing to
@@ -72,7 +75,8 @@ enum DType : int { kF16 = 0, kBF16 = 1, kF32 = 2 };
 struct State {
   int rank = 0;
   int world = 0;
-  size_t slot_words = 0;  // LL words per (parity, source) slot = max data words
+  size_t max_words = 0;   // max data words (4 bytes) per call
+  size_t slot_words = 0;  // uint64 per (parity, source) slot: 2 x ceil(max_words / 3), 4 KB aligned
   size_t buf_bytes = 0;
   uint64_t *recv[kMaxWorld] = {};  // [rank] = own buffer, others = IPC-mapped peers
   bool mapped[kMaxWorld] = {};
@@ -127,9 +131,23 @@ struct Ptrs {
   uint64_t *p[kMaxWorld];
 };
 
-sycl::nd_range<1> grid(size_t nw) {
-  size_t groups = std::min(kMaxGroups, std::max<size_t>(1, (nw + kWG - 1) / kWG));
+sycl::nd_range<1> grid(size_t items) {
+  size_t groups = std::min(kMaxGroups, std::max<size_t>(1, (items + kWG - 1) / kWG));
   return sycl::nd_range<1>(groups * kWG, kWG);
+}
+
+using u32x4 = sycl::vec<uint32_t, 4>;
+
+inline size_t ll_words(size_t nw) { return (nw + 2) / 3; }  // 16-byte LL words for nw data words
+
+// Store LL word j (data words 3j..3j+2 of `in`, zero past the end, then the tag)
+// with one 16-byte store.
+inline void put_ll(uint64_t *dst, const uint32_t *in, size_t nw, size_t j, uint32_t tag) {
+  const size_t b = 3 * j;
+  const uint32_t d0 = in[b];
+  const uint32_t d1 = b + 1 < nw ? in[b + 1] : 0u;
+  const uint32_t d2 = b + 2 < nw ? in[b + 2] : 0u;
+  *reinterpret_cast<u32x4 *>(dst + 2 * j) = u32x4(d0, d1, d2, tag);
 }
 
 // Push this rank's words into `peer`'s receive buffer. The first push kernel of a
@@ -140,18 +158,19 @@ void launch_push(sycl::queue &q, const State &s, int peer, bool first, const uin
   uint64_t *ctl = s.ctl;
   const int rank = s.rank, world = s.world;
   const size_t slot = s.slot_words;
-  q.parallel_for(grid(nw), [=](sycl::nd_item<1> it) {
+  const size_t nll = ll_words(nw);
+  q.parallel_for(grid(nll), [=](sycl::nd_item<1> it) {
     const size_t g = it.get_global_id(0), G = it.get_global_range(0);
     const uint64_t n = first ? ctl[0] + 1 : ctl[1];
     if (first && g == 0) ctl[1] = n;
-    const uint64_t tag = uint64_t(call_tag(n)) << 32;
+    const uint32_t tag = call_tag(n);
     uint64_t *dst = peer_buf + (size_t(n & 1) * world + rank) * slot;
-    for (size_t i = g; i < nw; i += G) dst[i] = tag | in[i];
+    for (size_t j = g; j < nll; j += G) put_ll(dst, in, nw, j, tag);
   });
 }
 
 // Wait for every peer's words of this call, sum in rank order, write out.
-// `out` may alias `in`: each work-item reads in[i] before writing out[i].
+// `out` may alias `in`: each work-item reads in[3j..3j+2] before writing them.
 // If `last_peer` >= 0 the kernel first pushes this rank's words to that peer (the
 // last push of the call), saving one kernel launch. Each work-item does all of
 // its push stores before it polls, and the push indices match the reduce
@@ -166,41 +185,54 @@ void launch_reduce(sycl::queue &q, const State &s, const uint32_t *in, uint32_t 
   uint64_t *ctl = s.ctl;
   const int rank = s.rank, world = s.world;
   const size_t slot = s.slot_words;
+  const size_t nll = ll_words(nw);
   uint64_t *peer_buf = last_peer >= 0 ? s.recv[last_peer] : nullptr;
-  q.parallel_for(grid(nw), [=](sycl::nd_item<1> it) {
+  q.parallel_for(grid(nll), [=](sycl::nd_item<1> it) {
     const size_t g = it.get_global_id(0), G = it.get_global_range(0);
     const uint64_t n = ctl[1];
     const uint32_t tag = call_tag(n);
     if (peer_buf) {
-      const uint64_t t = uint64_t(tag) << 32;
       uint64_t *dst = peer_buf + (size_t(n & 1) * world + rank) * slot;
-      for (size_t i = g; i < nw; i += G) dst[i] = t | in[i];
+      for (size_t j = g; j < nll; j += G) put_ll(dst, in, nw, j, tag);
     }
     const uint64_t *base = own + size_t(n & 1) * world * slot;
-    for (size_t i = g; i < nw; i += G) {
-      float s0 = 0.f, s1 = 0.f;
+    for (size_t j = g; j < nll; j += G) {
+      const size_t b = 3 * j;
+      float acc[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
       for (int k = 0; k < world; k++) {
-        uint32_t w;
+        uint32_t w[3];
         if (k == rank) {
-          w = in[i];
+          w[0] = in[b];
+          w[1] = b + 1 < nw ? in[b + 1] : 0u;
+          w[2] = b + 2 < nw ? in[b + 2] : 0u;
         } else {
-          a64sys a(*const_cast<uint64_t *>(base + size_t(k) * slot + i));
-          uint64_t v;
+          uint64_t *p = const_cast<uint64_t *>(base + size_t(k) * slot + 2 * j);
+          a64sys hi(p[1]);
+          uint64_t h;
           uint64_t spins = 0;
-          while (uint32_t((v = a.load()) >> 32) != tag) {
+          while (uint32_t((h = hi.load()) >> 32) != tag) {
             if (++spins > kSpinLimit) {
               a64dev(ctl[2]).fetch_add(1);
               break;
             }
           }
-          w = uint32_t(v);
+          // The whole 16-byte word landed together, so the low half is fresh too.
+          const uint64_t l = a64sys(p[0]).load();
+          w[0] = uint32_t(l);
+          w[1] = uint32_t(l >> 32);
+          w[2] = uint32_t(h);
         }
-        float a, b;
-        unpack<DT>(w, a, b);
-        s0 += a;
-        s1 += b;
+#pragma unroll
+        for (int c = 0; c < 3; c++) {
+          float a, bb;
+          unpack<DT>(w[c], a, bb);
+          acc[2 * c] += a;
+          acc[2 * c + 1] += bb;
+        }
       }
-      out[i] = pack<DT>(s0, s1);
+      out[b] = pack<DT>(acc[0], acc[1]);
+      if (b + 1 < nw) out[b + 1] = pack<DT>(acc[2], acc[3]);
+      if (b + 2 < nw) out[b + 2] = pack<DT>(acc[4], acc[5]);
     }
     if (g == 0) ctl[0] = n;  // nobody in this kernel reads ctl[0]
   });
@@ -210,8 +242,8 @@ void launch_reduce(sycl::queue &q, const State &s, const uint32_t *in, uint32_t 
 
 extern "C" {
 
-// Allocate this rank's receive buffer (2 parities x world slots x max_bytes/4 LL
-// words) and control words, zeroed. Returns a handle or nullptr (see err).
+// Allocate this rank's receive buffer (2 parities x world slots x
+// ceil(max_bytes/12) 16-byte LL words) and control words, zeroed. Returns a handle or nullptr (see err).
 void *xpu_p2p_ar_create(void *queue, int rank, int world, uint64_t max_bytes, char *err, int errlen) {
   if (world < 2 || world > kMaxWorld || rank < 0 || rank >= world || max_bytes < 4 || max_bytes % 4) {
     set_err(err, errlen, "bad rank/world/max_bytes");
@@ -226,7 +258,10 @@ void *xpu_p2p_ar_create(void *queue, int rank, int world, uint64_t max_bytes, ch
     State *s = new State();
     s->rank = rank;
     s->world = world;
-    s->slot_words = max_bytes / 4;
+    s->max_words = max_bytes / 4;
+    // Round each slot up to 4 KB: misaligned slots turn the coalesced 64-byte PCIe
+    // writes into partial-line writes, which made the 16-byte LL version ~4x slower.
+    s->slot_words = (2 * ll_words(s->max_words) + 511) / 512 * 512;
     s->buf_bytes = 2 * size_t(world) * s->slot_words * sizeof(uint64_t);
     for (int k = 0; k < kMaxWorld; k++) s->peer_fd[k] = -1;
     s->ctx = new sycl::context(q.get_context());
@@ -339,7 +374,7 @@ int xpu_p2p_ar_warmup(void *state, void *queue, char *err, int errlen) {
 int xpu_p2p_ar_all_reduce(void *state, void *queue, const void *in, void *out, uint64_t nbytes, int dtype) {
   State *s = static_cast<State *>(state);
   size_t nw = size_t(nbytes / 4);
-  if (nbytes % 4 || nw == 0 || nw > s->slot_words) return -1;
+  if (nbytes % 4 || nw == 0 || nw > s->max_words) return -1;
   sycl::queue &q = *static_cast<sycl::queue *>(queue);
   const uint32_t *I = static_cast<const uint32_t *>(in);
   uint32_t *O = static_cast<uint32_t *>(out);

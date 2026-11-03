@@ -20,7 +20,14 @@ _INPLACE_ALL_REDUCE = os.environ.get("VLLM_XPU_INPLACE_ALLREDUCE", "1") == "1"
 # through oneCCL (see xpu_p2p_all_reduce.py). Messages above the limit, and all
 # other groups, stay on oneCCL.
 _P2P_ALL_REDUCE = os.environ.get("VLLM_XPU_P2P_ALLREDUCE", "0") == "1"
-_P2P_MAX_BYTES = int(os.environ.get("VLLM_XPU_P2P_ALLREDUCE_MAX_BYTES", str(80 * 1024)))
+# Break-even vs oneCCL at TP=3 on B70 is ~14 tokens of a 5120-wide fp16 model.
+_P2P_MAX_BYTES = int(os.environ.get("VLLM_XPU_P2P_ALLREDUCE_MAX_BYTES", str(140 * 1024)))
+# Messages oneCCL would need zero-padded (see all_reduce) cost it ~2x, so P2P
+# still wins up to a larger size for those.
+_P2P_PADDED_MAX_BYTES = max(
+    _P2P_MAX_BYTES,
+    int(os.environ.get("VLLM_XPU_P2P_ALLREDUCE_PADDED_MAX_BYTES", str(256 * 1024))),
+)
 
 # Debug: log the first N all-reduce calls per process (metadata only; no
 # device sync or allocation, so it is safe during graph capture).
@@ -75,7 +82,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
             from .xpu_p2p_all_reduce import XpuP2PAllReduce
 
             p2p_ar = XpuP2PAllReduce(
-                self.cpu_group, self.device, max_bytes=_P2P_MAX_BYTES
+                self.cpu_group, self.device, max_bytes=_P2P_PADDED_MAX_BYTES
             )
             self.p2p_ar = None if p2p_ar.disabled else p2p_ar
         if self.use_all2all:
@@ -114,20 +121,24 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # Reduce a zero-padded copy instead; the padding doesn't change the sum.
         #
         # Small messages take the P2P path when it is enabled. It handles any
-        # length, so they need no padding. should_use() depends only on shape
+        # length, so they need no padding, and it gets a larger size limit for
+        # messages oneCCL would have to pad. The choice depends only on shape
         # and dtype, so all ranks choose the same path.
+        quantum = self.world_size * 64
+        numel = input_.numel()
         p2p_ar = self.p2p_ar
         if (
             p2p_ar is not None
             and not _SKIP_ALL_REDUCE
             and not torch.compiler.is_compiling()
-            and p2p_ar.should_use(input_)
+            and p2p_ar.should_use(
+                input_,
+                _P2P_PADDED_MAX_BYTES if numel % quantum else _P2P_MAX_BYTES,
+            )
         ):
             return p2p_ar.all_reduce(
                 input_, inplace=allow_inplace and _INPLACE_ALL_REDUCE
             )
-        quantum = self.world_size * 64
-        numel = input_.numel()
         if numel % quantum and not _SKIP_ALL_REDUCE:
             padded = input_.new_zeros(numel + (-numel) % quantum)
             padded[:numel].copy_(input_.reshape(-1))

@@ -67,7 +67,11 @@ def _worker(rank: int, world: int, args, port: int, fails) -> None:
     max_elems = ar.max_bytes // 4
     for dtype in DTYPES:
         esz = torch.tensor([], dtype=dtype).element_size()
-        numels = sorted({2, 512, HIDDEN, 3 * HIDDEN, 6 * HIDDEN, ar.max_bytes // esz})
+        # 16-byte LL words hold three 4-byte words: cover all remainders mod 3
+        numels = sorted(
+            {2, 10, 512, HIDDEN, 3 * HIDDEN, 3 * HIDDEN + 4, 6 * HIDDEN}
+            | {ar.max_bytes // esz, ar.max_bytes // esz - 4 // esz}
+        )
         numels = [n for n in numels if n * esz <= ar.max_bytes and (n * esz) % 4 == 0]
         assert numels and max_elems > 0
         for numel in numels:
@@ -121,16 +125,27 @@ def _worker(rank: int, world: int, args, port: int, fails) -> None:
         errors.append(f"rank {rank}: {timeouts} poll timeouts")
 
     if args.bench:
-        for tokens in (1, 3, 6, 8):
+        for tokens in args.bench_tokens:
             n = tokens * HIDDEN
             if n * 2 > ar.max_bytes:
                 continue
             x = torch.randn(n, dtype=torch.float16, device=dev)
+            quantum = world * 64
+
+            def padded(x=x):  # what XpuCommunicator does when n % quantum != 0
+                p = x.new_zeros(n + (-n) % quantum)
+                p[:n].copy_(x)
+                dist.all_reduce(p)
+                return p[:n]
+
             res = {}
-            for name, fn in (
+            fns = [
                 ("p2p", lambda x=x: ar.all_reduce(x, inplace=True)),
                 ("oneCCL", lambda x=x: dist.all_reduce(x)),
-            ):
+            ]
+            if n % quantum:
+                fns.append(("padded", padded))
+            for name, fn in fns:
                 for _ in range(50):
                     fn()
                 torch.xpu.synchronize()
@@ -146,7 +161,12 @@ def _worker(rank: int, world: int, args, port: int, fails) -> None:
             if rank == 0:
                 print(
                     f"  bench fp16 {tokens:2d} tok ({n * 2:6d} B): "
-                    f"p2p {res['p2p']:6.1f} us  oneCCL {res['oneCCL']:6.1f} us",
+                    f"p2p {res['p2p']:6.1f} us  oneCCL {res['oneCCL']:6.1f} us"
+                    + (
+                        f"  oneCCL+pad {res['padded']:6.1f} us"
+                        if "padded" in res
+                        else ""
+                    ),
                     flush=True,
                 )
 
@@ -188,7 +208,12 @@ if pytest is not None:
         if world > torch.xpu.device_count():
             pytest.skip(f"needs {world} GPUs")
         args = argparse.Namespace(
-            max_bytes=80 * 1024, batches=2, batch=50, replays=50, bench=False
+            max_bytes=256 * 1024,
+            batches=2,
+            batch=50,
+            replays=50,
+            bench=False,
+            bench_tokens=[],
         )
         assert run(world, args) == []
 
@@ -196,11 +221,17 @@ if pytest is not None:
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--world", type=int, default=torch.xpu.device_count())
-    p.add_argument("--max-bytes", type=int, default=80 * 1024)
+    p.add_argument("--max-bytes", type=int, default=256 * 1024)
     p.add_argument("--batches", type=int, default=4)
     p.add_argument("--batch", type=int, default=100)
     p.add_argument("--replays", type=int, default=200)
     p.add_argument("--bench", action="store_true")
+    p.add_argument(
+        "--bench-tokens",
+        type=lambda s: [int(t) for t in s.split(",")],
+        default=[1, 3, 6, 8],
+        help="comma-separated token counts (x 5120 fp16) to benchmark",
+    )
     a = p.parse_args()
     problems = run(a.world, a)
     print("FAIL\n" + "\n".join(problems) if problems else "PASS")
