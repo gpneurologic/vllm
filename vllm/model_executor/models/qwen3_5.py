@@ -526,7 +526,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        import os
+
+        if os.environ.get("VLLM_XPU_LM_HEAD_FP8", "0") == "1":
+            from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
+                convert_lm_head_fp8,
+            )
+
+            convert_lm_head_fp8(self)
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(

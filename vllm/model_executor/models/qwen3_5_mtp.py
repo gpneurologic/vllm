@@ -255,6 +255,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self._draft_vocab_setup()
 
     def embed_input_ids(
         self,
@@ -301,6 +302,8 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
+        if self._draft_weight is not None:
+            return self._draft_logits(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -316,7 +319,111 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+        loaded = loader.load_weights(self._draft_vocab_capture(remap_weight_names(weights)))
+        import os
+
+        if os.environ.get("VLLM_MTP_FP8", "0") == "1":
+            from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
+                convert_unquantized_linears_fp8,
+            )
+
+            convert_unquantized_linears_fp8(self.model, "MTP draft layer")
+        return loaded
+
+    # ---- Private reduced-vocabulary draft head (VLLM_MTP_DRAFT_VOCAB=<ids.npy>) ----
+    # The draft normally shares the target's lm_head, so every drafted token reads the
+    # whole vocabulary (248k rows). With a list of frequent token ids, the draft scores
+    # only those rows; every other id gets -inf. The target still verifies every drafted
+    # token, so the output is unchanged; only the acceptance rate can move. The id list
+    # is split evenly across the TP ranks (not by vocab shard, since frequent ids
+    # cluster at the start of the vocabulary), and each rank keeps its rows, taken from
+    # lm_head.weight as the checkpoint streams past.
+    def _draft_vocab_setup(self) -> None:
+        import os
+
+        import numpy as np
+
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        self._draft_weight = None
+        path = os.environ.get("VLLM_MTP_DRAFT_VOCAB")
+        if not path or self.config.tie_word_embeddings:
+            return
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        ids = np.unique(np.load(path).astype(np.int64))
+        ids = ids[(ids >= 0) & (ids < self.config.vocab_size)]
+        per = -(-len(ids) // tp)
+        per = -(-per // 16) * 16
+        ids = np.concatenate([ids, np.repeat(ids[-1], per * tp - len(ids))])
+        self._draft_ids_np = ids[rank * per:(rank + 1) * per]
+        self._draft_ids_all = torch.from_numpy(ids)
+        self._draft_ids_local = torch.from_numpy(self._draft_ids_np)
+        self._draft_tp = tp
+        logger.info("MTP draft vocabulary: %d ids from %s, %d rows per rank",
+                    len(np.unique(ids)), path, per)
+
+    def _draft_vocab_capture(self, weights):
+        if not hasattr(self, "_draft_ids_np"):
+            yield from weights
+            return
+        dtype = self.vllm_config.model_config.dtype
+        for name, weight in weights:
+            if name == "lm_head.weight":
+                dev = self.logits_processor_device()
+                rows = weight.index_select(0, self._draft_ids_local.to(weight.device))
+                self._draft_weight = rows.to(device=dev, dtype=dtype).contiguous()
+                import os
+
+                if os.environ.get("VLLM_MTP_DRAFT_HEAD", "").lower() == "fp8":
+                    from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
+                        quantize_rows_fp8,
+                    )
+
+                    self._draft_weight, self._draft_scale = quantize_rows_fp8(self._draft_weight)
+                self._draft_ids_all = self._draft_ids_all.to(dev)
+                self._draft_ids_local = self._draft_ids_local.to(dev)
+                logger.info("MTP draft head: %s rows x %d per rank (%.0f MiB) instead of the shared "
+                            "lm_head", self._draft_weight.shape[0], self._draft_weight.shape[1],
+                            self._draft_weight.numel() * self._draft_weight.element_size() / 2**20)
+            yield name, weight
+
+    def logits_processor_device(self) -> torch.device:
+        return next(self.model.parameters()).device
+
+    def _draft_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        w = self._draft_weight
+        scale = getattr(self, "_draft_scale", None)
+        if scale is not None:
+            from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import fp8_linear
+
+            return fp8_linear(hidden_states, w, scale)
+        return torch.nn.functional.linear(hidden_states.to(w.dtype), w)
+
+    def _draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        local = self._draft_local(hidden_states)
+        part = tensor_model_parallel_all_gather(local, dim=-1) if self._draft_tp > 1 else local
+        full = part.new_full((part.shape[0], self.config.vocab_size), float("-inf"))
+        full.index_copy_(1, self._draft_ids_all, part)
+        return full
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._draft_weight is None:
+            return LocalArgmaxMixin.get_top_tokens(self, hidden_states)
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        local = self._draft_local(hidden_states)
+        vals, idx = local.max(dim=-1)
+        gid = self._draft_ids_local[idx]
+        if self._draft_tp == 1:
+            return gid
+        pair = torch.stack([vals.float(), gid.float()], dim=-1)          # [T, 2]
+        allp = tensor_model_parallel_all_gather(pair, dim=-1)            # [T, 2*tp]
+        allp = allp.view(allp.shape[0], self._draft_tp, 2)
+        best = allp[..., 0].argmax(dim=-1, keepdim=True)
+        return allp[..., 1].gather(1, best).squeeze(1).long()
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
