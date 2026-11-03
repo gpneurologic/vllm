@@ -13,7 +13,8 @@
 //  * Data is pushed into the receiver's memory and polled there with local
 //    system-scope atomic loads. Polling a peer's memory over PCIe doesn't work.
 //  * One kernel storing to two different peers is ~50x slower than storing to
-//    one, so each peer gets its own push kernel. Then one kernel waits and sums.
+//    one, so each peer gets its own push kernel, except that the last push is
+//    done by the kernel that then waits and sums (it stores to one peer only).
 //  * The call number lives in device memory, so recorded XPU graphs advance it
 //    on every replay. Calls alternate between two buffer sets (parity), so a
 //    rank that starts call n+1 never overwrites data a slower rank still reads.
@@ -34,6 +35,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 
@@ -52,6 +54,13 @@ constexpr size_t kMaxGroups = 64;
 // Safety net only: a rank that never arrives makes the poll give up after
 // roughly a minute instead of spinning forever. Counted in ctl[2].
 constexpr uint64_t kSpinLimit = 1ull << 32;
+
+// VLLM_XPU_P2P_ALLREDUCE_NO_MERGE=1 keeps every push in its own kernel (the
+// pre-merge behaviour), for A/B measurements.
+const bool g_no_merge = [] {
+  const char *v = std::getenv("VLLM_XPU_P2P_ALLREDUCE_NO_MERGE");
+  return v && *v && std::strcmp(v, "0") != 0;
+}();
 
 using a64sys = sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
                                 sycl::access::address_space::global_space>;
@@ -143,16 +152,30 @@ void launch_push(sycl::queue &q, const State &s, int peer, bool first, const uin
 
 // Wait for every peer's words of this call, sum in rank order, write out.
 // `out` may alias `in`: each work-item reads in[i] before writing out[i].
+// If `last_peer` >= 0 the kernel first pushes this rank's words to that peer (the
+// last push of the call), saving one kernel launch. Each work-item does all of
+// its push stores before it polls, and the push indices match the reduce
+// indices, so nothing in the kernel waits on its own stores. The kernel still
+// stores to one peer only (two peers in one kernel is ~50x slower on B70). It
+// relies on all its work-groups being resident at once (<= 64 groups of 256),
+// so a peer's merged kernel can't be stuck behind its own polling groups.
 template <int DT>
-void launch_reduce(sycl::queue &q, const State &s, const uint32_t *in, uint32_t *out, size_t nw) {
+void launch_reduce(sycl::queue &q, const State &s, const uint32_t *in, uint32_t *out, size_t nw,
+                   int last_peer = -1) {
   uint64_t *own = s.recv[s.rank];
   uint64_t *ctl = s.ctl;
   const int rank = s.rank, world = s.world;
   const size_t slot = s.slot_words;
+  uint64_t *peer_buf = last_peer >= 0 ? s.recv[last_peer] : nullptr;
   q.parallel_for(grid(nw), [=](sycl::nd_item<1> it) {
     const size_t g = it.get_global_id(0), G = it.get_global_range(0);
     const uint64_t n = ctl[1];
     const uint32_t tag = call_tag(n);
+    if (peer_buf) {
+      const uint64_t t = uint64_t(tag) << 32;
+      uint64_t *dst = peer_buf + (size_t(n & 1) * world + rank) * slot;
+      for (size_t i = g; i < nw; i += G) dst[i] = t | in[i];
+    }
     const uint64_t *base = own + size_t(n & 1) * world * slot;
     for (size_t i = g; i < nw; i += G) {
       float s0 = 0.f, s1 = 0.f;
@@ -320,15 +343,16 @@ int xpu_p2p_ar_all_reduce(void *state, void *queue, const void *in, void *out, u
   sycl::queue &q = *static_cast<sycl::queue *>(queue);
   const uint32_t *I = static_cast<const uint32_t *>(in);
   uint32_t *O = static_cast<uint32_t *>(out);
-  bool first = true;
-  for (int d = 1; d < s->world; d++) {  // peers in ring order from this rank
-    launch_push(q, *s, (s->rank + d) % s->world, first, I, nw);
-    first = false;
-  }
+  // Peers in ring order from this rank. With 3+ ranks the last push goes into the
+  // reduce kernel. With 2 ranks the only push must stay separate: it is the
+  // first push, which sets ctl[1] from ctl[0], and the reduce writes ctl[0].
+  const int separate = s->world > 2 && !g_no_merge ? s->world - 2 : s->world - 1;
+  for (int d = 1; d <= separate; d++) launch_push(q, *s, (s->rank + d) % s->world, d == 1, I, nw);
+  const int last = separate < s->world - 1 ? (s->rank + s->world - 1) % s->world : -1;
   switch (dtype) {
-    case kF16: launch_reduce<kF16>(q, *s, I, O, nw); break;
-    case kBF16: launch_reduce<kBF16>(q, *s, I, O, nw); break;
-    case kF32: launch_reduce<kF32>(q, *s, I, O, nw); break;
+    case kF16: launch_reduce<kF16>(q, *s, I, O, nw, last); break;
+    case kBF16: launch_reduce<kBF16>(q, *s, I, O, nw, last); break;
+    case kF32: launch_reduce<kF32>(q, *s, I, O, nw, last); break;
     default: return -2;
   }
   return 0;
