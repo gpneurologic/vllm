@@ -16,5 +16,14 @@ if ! command -v icpx >/dev/null 2>&1; then
   source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
   set -u
 fi
-icpx -fsycl -O2 -std=c++17 -fPIC -shared "$src" -o "$out" -lze_loader
-echo "built $out"
+# Ahead-of-time compile for the target GPU so the driver doesn't JIT the kernels on the first
+# call in every process. The plain SPIR-V image (spir64) is kept as a fallback for other GPUs.
+#   XPU_P2P_AOT_DEVICE  ocloc device name (default bmg-g31 = Arc Pro B70); "none" = SPIR-V only
+aot_device="${XPU_P2P_AOT_DEVICE:-bmg-g31}"
+if [ "$aot_device" = "none" ]; then
+  targets=(-fsycl-targets=spir64)
+else
+  targets=(-fsycl-targets=spir64_gen,spir64 -Xsycl-target-backend=spir64_gen "-device $aot_device")
+fi
+icpx -fsycl "${targets[@]}" -O2 -std=c++17 -fPIC -shared "$src" -o "$out" -lze_loader
+echo "built $out (AOT device: $aot_device)"
