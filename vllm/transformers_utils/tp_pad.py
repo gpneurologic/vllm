@@ -4,25 +4,30 @@
 
 Every dimension vLLM splits across GPUs must divide by the TP size. Qwen3.8-27B
 has 4 KV heads, 16 linear-attention key heads and an MLP of 17408, so it can't
-run at TP=3 as is. Setting ``VLLM_PAD_FOR_TP=<tp>`` appends zero-weight dummy
-heads and MLP channels while the checkpoint is read, instead of writing a
-padded copy of the model:
+run at TP=3 as is. When the TP size doesn't divide the model, vLLM now appends
+zero-weight dummy heads and MLP channels while the checkpoint is read, instead
+of needing a padded copy of the model on disk:
 
   full attention    query heads H -> H', KV heads KV -> KV' (each KV head keeps
                     its group of H/KV query heads; the dummies form whole groups)
   linear attention  key heads LK -> LK', value heads LV -> LV' (LV/LK per key)
   MLP               intermediate I -> I' (a multiple of tp * 128)
 
-Dummy heads have zero projections in and out, so the model computes exactly
-what it did. The padding is the same as host/tp3_pad/pad_qwen35_fp8.py (the
-FP8 ``-tp3pad`` folder), so outputs match that folder. Supported weights:
-unquantized, block FP8 (``weight_scale_inv``) and GPTQ-format INT4
-(``qweight``/``scales``/``qzeros``/``g_idx``, e.g. AutoRound). The vision
-encoder is not padded; run it with ``--mm-encoder-tp-mode data``.
+The padding is the smallest that splits evenly, and it is decided from the
+model's config and the TP size alone: nothing to configure. Models that
+already divide (and other architectures) are left unchanged. Dummy heads have
+zero projections in and out, so the model computes exactly what it did; the
+layout is the same as host/tp3_pad/pad_qwen35_fp8.py (the FP8 ``-tp3pad``
+folder), so outputs match that folder. Supported weights: unquantized, block
+FP8 (``weight_scale_inv``) and GPTQ-format INT4 (``qweight``/``scales``/
+``qzeros``/``g_idx``, e.g. AutoRound).
+
+The vision encoder is not padded. If its heads don't divide by the TP size
+and no ``--mm-encoder-tp-mode`` was given, it runs whole on every GPU
+(``data`` mode) instead; see pick_mm_encoder_tp_mode().
 """
 
 import math
-import os
 import re
 from collections.abc import Iterable, Iterator
 from typing import Any
@@ -33,9 +38,11 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ENV = "VLLM_PAD_FOR_TP"
+TAG = "TP padding"
 PLAN_ATTR = "vllm_tp_pad_plan"
 ALIGN = 128  # MLP / per-GPU alignment: FP8 blocks, GPTQ groups (<=128) and packing
+# Text configs this padding knows the weight layout of (dense Qwen3.5/3.8).
+MODEL_TYPES = ("qwen3_5_text",)
 
 _TEXT_KEYS = (
     "num_attention_heads",
@@ -48,66 +55,87 @@ _TEXT_KEYS = (
     "intermediate_size",
 )
 
+# The tensor-parallel size of the engine being configured. EngineArgs sets it
+# before it builds the ModelConfigs (target and draft), which pad themselves
+# right after reading the HF config, before anything derives sizes from it.
+_tp_size: int | None = None
+
+
+def set_tensor_parallel_size(tp: int | None) -> None:
+    global _tp_size
+    _tp_size = int(tp) if tp else None
+
 
 def _round_up(x: int, m: int) -> int:
     return (x + m - 1) // m * m
 
 
-def requested_tp() -> int | None:
-    v = os.environ.get(ENV, "").strip()
-    if not v or v == "0":
-        return None
-    tp = int(v)
-    if tp < 1:
-        raise ValueError(f"{ENV} must be a positive integer, got {v!r}")
-    return tp
-
-
-def _quant_info(hf_config: Any) -> tuple[int | None, int | None]:
-    """(fp8 block size, gptq group size) from the checkpoint's quant config."""
+def _quant_info(hf_config: Any) -> tuple[int | None, int | None, str | None]:
+    """(FP8 block size, GPTQ group size, why unsupported) from the checkpoint's
+    quant config. Supported: none, block FP8 (``fp8`` with weight_block_size, or
+    compressed-tensors with block weights) and GPTQ-format INT4 (``gptq``,
+    which AutoRound uses)."""
     q = getattr(hf_config, "quantization_config", None) or {}
     if not isinstance(q, dict):
         q = q.to_dict() if hasattr(q, "to_dict") else vars(q)
-    block = None
-    if q.get("quant_method") == "fp8" and q.get("weight_block_size"):
-        bs = q["weight_block_size"]
-        assert bs[0] == bs[1], f"non-square FP8 blocks {bs}"
-        block = int(bs[0])
-    group = int(q["group_size"]) if "group_size" in q and q.get("bits") else None
-    return block, group
+    method = q.get("quant_method")
+    if not method:
+        return None, None, None
+    if method == "fp8":
+        bs = q.get("weight_block_size")
+        if not bs or bs[0] != bs[1]:
+            return None, None, f"fp8 without square weight blocks ({bs})"
+        return int(bs[0]), None, None
+    if method == "compressed-tensors":
+        blocks = set()
+        for g in (q.get("config_groups") or {}).values():
+            w = g.get("weights") or {}
+            bs = w.get("block_structure")
+            if w.get("strategy") != "block" or not bs or bs[0] != bs[1] or w.get("num_bits") != 8:
+                return None, None, f"compressed-tensors weights {w.get('strategy')} {bs}"
+            blocks.add(int(bs[0]))
+        if len(blocks) != 1:
+            return None, None, f"compressed-tensors block sizes {sorted(blocks)}"
+        return blocks.pop(), None, None
+    if method == "gptq" and q.get("bits") == 4 and not q.get("desc_act"):
+        return None, int(q["group_size"]), None
+    return None, None, f"quant_method={method}"
 
 
-def maybe_pad_config(hf_config: Any, hf_text_config: Any) -> None:
-    """If VLLM_PAD_FOR_TP is set, enlarge the head counts and MLP size in
-    ``hf_text_config`` (in place) and remember the original sizes for the
-    weight loader. Does nothing for models that already divide."""
-    tp = requested_tp()
-    if tp is None or getattr(hf_text_config, PLAN_ATTR, None) is not None:
+def maybe_pad_config(hf_config: Any, hf_text_config: Any, tp: int | None = None) -> None:
+    """If the TP size doesn't divide this Qwen3.5/3.8 model, enlarge its head
+    counts and MLP size in ``hf_text_config`` (in place) to the smallest sizes
+    that do, and remember the original sizes for the weight loader."""
+    tp = tp or _tp_size
+    if not tp or tp == 1 or getattr(hf_text_config, PLAN_ATTR, None) is not None:
         return
-    missing = [k for k in _TEXT_KEYS if getattr(hf_text_config, k, None) is None]
-    if missing:
-        raise ValueError(
-            f"{ENV} is set, but this model has no {missing} in its config; "
-            "load-time padding supports Qwen3.5/3.8 (hybrid attention) models only."
-        )
+    if getattr(hf_text_config, "model_type", None) not in MODEL_TYPES:
+        return
+    if any(getattr(hf_text_config, k, None) is None for k in _TEXT_KEYS):
+        return
     c = {k: int(getattr(hf_text_config, k)) for k in _TEXT_KEYS}
     H, KV, D = c["num_attention_heads"], c["num_key_value_heads"], c["head_dim"]
     LK, LV = c["linear_num_key_heads"], c["linear_num_value_heads"]
     DK, DV = c["linear_key_head_dim"], c["linear_value_head_dim"]
     inter = c["intermediate_size"]
     if H % KV or LV % LK:
-        raise ValueError(f"{ENV}: unexpected head layout H={H} KV={KV} LK={LK} LV={LV}")
+        return  # not the layout this knows; let vLLM's own checks report it
     KV2 = _round_up(KV, tp)
     H2 = KV2 * (H // KV)
     LK2 = _round_up(LK, tp)
     LV2 = LK2 * (LV // LK)
-    inter2 = _round_up(inter, tp * ALIGN)
+    block, group, unsupported = _quant_info(hf_config)
+    unit = math.lcm(ALIGN, block or 1, group or 1)  # whole FP8 blocks / GPTQ groups per GPU
+    inter2 = inter if inter % (tp * unit) == 0 else _round_up(inter, tp * unit)
     if (H2, KV2, LK2, LV2, inter2) == (H, KV, LK, LV, inter):
-        logger.info("%s=%d: model already divides by %d; no padding", ENV, tp, tp)
-        return
+        return  # already splits evenly
+    if unsupported:
+        raise ValueError(
+            f"{TAG}: this model doesn't split across {tp} GPUs and would need padding, "
+            f"but its weight format isn't supported for that ({unsupported}). "
+            "Use a TP size that divides it, or a pre-padded checkpoint."
+        )
     gate = 2 if getattr(hf_text_config, "attn_output_gate", True) else 1
-    block, group = _quant_info(hf_config)
-    unit = math.lcm(ALIGN, block or 1, group or 1)
     for name, v in (
         ("q rows", H2 * gate * D // tp),
         ("kv rows", KV2 * D // tp),
@@ -117,7 +145,7 @@ def maybe_pad_config(hf_config: Any, hf_text_config: Any) -> None:
         ("mlp", inter2 // tp),
     ):
         if v % unit:
-            raise ValueError(f"{ENV}={tp}: {name} per GPU ({v}) is not a multiple of {unit}")
+            raise ValueError(f"{TAG} for TP={tp}: {name} per GPU ({v}) is not a multiple of {unit}")
     plan = dict(
         tp=tp, H=H, H2=H2, KV=KV, KV2=KV2, D=D, gate=gate, LK=LK, LK2=LK2,
         LV=LV, LV2=LV2, DK=DK, DV=DV, I=inter, I2=inter2, block=block, group=group,
@@ -129,10 +157,28 @@ def maybe_pad_config(hf_config: Any, hf_text_config: Any) -> None:
     hf_text_config.intermediate_size = inter2
     setattr(hf_text_config, PLAN_ATTR, plan)
     logger.info(
-        "%s=%d: padding at load time: query heads %d->%d, KV heads %d->%d, "
-        "linear key heads %d->%d, value heads %d->%d, MLP %d->%d",
-        ENV, tp, H, H2, KV, KV2, LK, LK2, LV, LV2, inter, inter2,
+        "%s: TP=%d doesn't divide the model, padding it while loading: query heads "
+        "%d->%d, KV heads %d->%d, linear key heads %d->%d, value heads %d->%d, MLP %d->%d",
+        TAG, tp, H, H2, KV, KV2, LK, LK2, LV, LV2, inter, inter2,
     )
+
+
+def pick_mm_encoder_tp_mode(hf_config: Any, requested: str | None) -> str | None:
+    """``data`` when the vision encoder's heads don't divide by the TP size and
+    no mode was asked for explicitly; otherwise ``requested`` unchanged."""
+    tp = _tp_size
+    vision = getattr(hf_config, "vision_config", None)
+    heads = getattr(vision, "num_heads", None) or getattr(vision, "num_attention_heads", None)
+    if not tp or tp == 1 or not heads or heads % tp == 0:
+        return requested
+    if requested not in (None, "weights"):
+        return requested  # e.g. already "data"
+    # "weights" (the default) would split the heads across GPUs, which can't work
+    logger.info(
+        "%s: the vision encoder's %d heads don't divide by TP=%d; running it whole "
+        "on every GPU (mm_encoder_tp_mode=data)", TAG, heads, tp,
+    )
+    return "data"
 
 
 def get_plan(hf_text_config: Any) -> dict | None:
@@ -164,7 +210,10 @@ def _rules(p: dict) -> list[tuple[str, str, list[tuple[int, int]]]]:
     ]
 
 
-_SUFFIXES = (".weight_scale_inv", ".qweight", ".qzeros", ".scales", ".g_idx", ".weight", ".bias")
+_SUFFIXES = (
+    ".weight_scale_inv", ".weight_scale", ".qweight", ".qzeros", ".scales", ".g_idx",
+    ".weight", ".bias",
+)
 
 
 def _split(name: str) -> tuple[str, str]:
@@ -176,7 +225,7 @@ def _split(name: str) -> tuple[str, str]:
 
 def _pad(t: torch.Tensor, dim: int, segs: list[tuple[int, int]], fill) -> torch.Tensor:
     if sum(o for o, _ in segs) != t.shape[dim]:
-        raise ValueError(f"{ENV}: shape {tuple(t.shape)} dim {dim} != segments {segs}")
+        raise ValueError(f"{TAG}: shape {tuple(t.shape)} dim {dim} != segments {segs}")
     fp8 = t.dtype == torch.float8_e4m3fn
     src = t.view(torch.uint8) if fp8 else t  # byte 0 == +0.0 in e4m3
     parts, start = [], 0
@@ -194,7 +243,7 @@ def _pad(t: torch.Tensor, dim: int, segs: list[tuple[int, int]], fill) -> torch.
 def _scaled(segs: list[tuple[int, int]], unit: int, what: str) -> list[tuple[int, int]]:
     for o, n in segs:
         if o % unit or n % unit:
-            raise ValueError(f"{ENV}: segment {o}->{n} is not whole {what} ({unit})")
+            raise ValueError(f"{TAG}: segment {o}->{n} is not whole {what} ({unit})")
     return [(o // unit, n // unit) for o, n in segs]
 
 
@@ -205,14 +254,16 @@ def _pad_tensor(name: str, t: torch.Tensor, kind: str, segs, p: dict) -> torch.T
         # nn.Linear weight [out, in], conv1d [out, 1, k], 1-D params [out]
         dim = 0 if kind == "out" else 1
         return _pad(t, dim, segs, 0.0)
-    if suffix == ".weight_scale_inv":  # block FP8 scales [out/B, in/B]
+    if suffix in (".weight_scale_inv", ".weight_scale"):
+        # block FP8 scales [out/B, in/B] (fp8: weight_scale_inv, compressed-tensors:
+        # weight_scale); 1-D conv/norm-like params never carry these
         b = p["block"]
-        if b is None:
-            raise ValueError(f"{ENV}: {name} but no FP8 block size in the config")
+        if b is None or t.dim() != 2:
+            raise ValueError(f"{TAG}: {name} {tuple(t.shape)} is not a block-FP8 scale")
         return _pad(t, 0 if kind == "out" else 1, _scaled(segs, b, "FP8 blocks"), 1.0)
     group = p["group"]
     if group is None:
-        raise ValueError(f"{ENV}: {name} but no quantization group size in the config")
+        raise ValueError(f"{TAG}: {name} but no quantization group size in the config")
     pack = 32 // 4  # 4-bit values per int32
     if suffix == ".qweight":  # [in/pack, out]
         if kind == "out":
@@ -232,10 +283,10 @@ def _pad_tensor(name: str, t: torch.Tensor, kind: str, segs, p: dict) -> torch.T
             return t
         old = t.shape[0]
         if not torch.equal(t, torch.arange(old, dtype=t.dtype) // group):
-            raise ValueError(f"{ENV}: {name} uses act-order (desc_act); not supported")
+            raise ValueError(f"{TAG}: {name} uses act-order (desc_act); not supported")
         new = old + sum(n - o for o, n in segs)
         return torch.arange(new, dtype=t.dtype) // group
-    raise ValueError(f"{ENV}: don't know how to pad {name}")
+    raise ValueError(f"{TAG}: don't know how to pad {name}")
 
 
 def pad_weights(
@@ -253,4 +304,4 @@ def pad_weights(
                     padded += 1
                     break
         yield name, t
-    logger.info("%s: padded %d tensors while loading", ENV, padded)
+    logger.info("%s: padded %d tensors while loading", TAG, padded)

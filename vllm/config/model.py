@@ -570,8 +570,8 @@ class ModelConfig:
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        # VLLM_PAD_FOR_TP: enlarge head counts / MLP so the model splits evenly
-        # across GPUs; the weights get matching zero padding while loading.
+        # If the TP size doesn't divide the model's heads / MLP, enlarge them so
+        # it splits evenly; the weights get matching zero padding while loading.
         from vllm.transformers_utils.tp_pad import maybe_pad_config
 
         maybe_pad_config(self.hf_config, self.hf_text_config)
@@ -704,6 +704,10 @@ class ModelConfig:
 
         # Init multimodal config if needed
         if self._model_info.supports_multimodal:
+            from vllm.transformers_utils.tp_pad import pick_mm_encoder_tp_mode
+
+            # A vision encoder whose heads don't divide by TP runs whole per GPU.
+            mm_encoder_tp_mode = pick_mm_encoder_tp_mode(self.hf_config, mm_encoder_tp_mode)
             if (
                 mm_encoder_tp_mode == "data"
                 and not self._model_info.supports_multimodal_encoder_tp_data

@@ -330,7 +330,8 @@ class DefaultModelLoader(BaseModelLoader):
         if plan is None:
             yield from weights
         else:
-            # zero-pad checkpoint tensors to the sizes set by VLLM_PAD_FOR_TP
+            # the model was enlarged to split by the TP size (tp_pad.py):
+            # zero-pad its checkpoint tensors to match
             yield from pad_weights(weights, plan)
 
     def _get_all_weights(

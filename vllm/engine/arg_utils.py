@@ -1877,6 +1877,12 @@ class EngineArgs:
                 )
             )
 
+        # Models whose heads / MLP don't split by the TP size get padded while
+        # loading (vllm/transformers_utils/tp_pad.py); it needs the TP size
+        # before the ModelConfigs (target and draft) are built.
+        from vllm.transformers_utils.tp_pad import set_tensor_parallel_size
+
+        set_tensor_parallel_size(self.tensor_parallel_size)
         model_config = self.create_model_config()
         self.model = model_config.model
         self.model_weights = model_config.model_weights
