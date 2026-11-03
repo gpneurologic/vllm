@@ -323,6 +323,21 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        from vllm.transformers_utils.tp_pad import get_plan, pad_weights
+
+        weights = self._get_all_weights(model_config, model)
+        plan = get_plan(model_config.hf_text_config)
+        if plan is None:
+            yield from weights
+        else:
+            # zero-pad checkpoint tensors to the sizes set by VLLM_PAD_FOR_TP
+            yield from pad_weights(weights, plan)
+
+    def _get_all_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,

@@ -570,6 +570,11 @@ class ModelConfig:
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        # VLLM_PAD_FOR_TP: enlarge head counts / MLP so the model splits evenly
+        # across GPUs; the weights get matching zero padding while loading.
+        from vllm.transformers_utils.tp_pad import maybe_pad_config
+
+        maybe_pad_config(self.hf_config, self.hf_text_config)
         self.model_arch_config = self.get_model_arch_config()
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
