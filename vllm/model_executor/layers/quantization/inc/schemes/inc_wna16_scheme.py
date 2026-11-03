@@ -44,7 +44,12 @@ class INCWna16Scheme(INCScheme):
                     INCXPULinearMethod,
                 )
 
-                is_ark_available, ark_error, _, _ = get_ark_state()
+                is_ark_available, ark_error, ark, _ = get_ark_state()
+                if is_ark_available and getattr(ark, "xpu_lib", None) is None:
+                    # Only ARK's CPU library loaded (e.g. libiomp5.so is missing):
+                    # it would fail on XPU tensors while repacking the weights.
+                    is_ark_available = False
+                    ark_error = "auto_round_kernel has no XPU library"
                 if is_ark_available:
                     return INCLinearMethod(INCARKLinearMethod(layer_config))
                 elif layer_config.bits == 2:
