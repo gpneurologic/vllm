@@ -349,6 +349,8 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         path = os.environ.get("VLLM_MTP_DRAFT_VOCAB")
         if not path or self.config.tie_word_embeddings:
             return
+        if path == "default":  # the bundled list for the Qwen3.5+ tokenizer (see data/NOTICE)
+            path = os.path.join(os.path.dirname(__file__), "data", "qwen3_5_draft_vocab_65536.npy")
         tp = get_tensor_model_parallel_world_size()
         rank = get_tensor_model_parallel_rank()
         ids = np.unique(np.load(path).astype(np.int64))
