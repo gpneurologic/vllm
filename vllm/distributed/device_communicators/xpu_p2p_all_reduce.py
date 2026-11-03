@@ -49,6 +49,12 @@ def _load_library() -> ctypes.CDLL:
     lib.xpu_p2p_ar_warmup.restype = i
     lib.xpu_p2p_ar_all_reduce.argtypes = [vp, vp, vp, vp, u64, i]
     lib.xpu_p2p_ar_all_reduce.restype = i
+    f32 = ctypes.c_float
+    lib.xpu_p2p_ar_fused_add_rms_norm.argtypes = [
+        *(vp, vp, vp, vp, vp, vp, vp),
+        *(u64, u64, i, i, f32, f32),
+    ]
+    lib.xpu_p2p_ar_fused_add_rms_norm.restype = i
     lib.xpu_p2p_ar_timeouts.argtypes = [vp, vp]
     lib.xpu_p2p_ar_timeouts.restype = u64
     lib.xpu_p2p_ar_destroy.argtypes = [vp]
@@ -181,6 +187,55 @@ class XpuP2PAllReduce:
         if rc != 0:
             raise RuntimeError(f"xpu_p2p_ar_all_reduce failed ({rc})")
         return out
+
+    def fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        weight_bias: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """All-reduce ``inp`` [..., hidden], then do vllm_ir fused_add_rms_norm
+        with ``residual`` and ``weight + weight_bias`` in the same kernel.
+        Returns (normed, new_residual), or None when this call can't take the
+        P2P path (the caller must then use the unfused ops). The answer
+        depends only on shapes and dtypes, so it is the same on all ranks."""
+        hidden = inp.shape[-1]
+        if (
+            not self.should_use(inp)
+            or residual.dtype != inp.dtype
+            or residual.shape != inp.shape
+            or not residual.is_contiguous()
+            or weight.dtype not in _DTYPE_CODES
+            or weight.numel() != hidden
+            or not weight.is_contiguous()
+            or inp.data_ptr() % 4
+        ):
+            return None
+        rows = inp.numel() // hidden
+        out = torch.empty_like(inp)
+        res_out = torch.empty_like(inp)
+        rc = self._lib.xpu_p2p_ar_fused_add_rms_norm(
+            self._state,
+            self._queue(),
+            inp.data_ptr(),
+            residual.data_ptr(),
+            weight.data_ptr(),
+            out.data_ptr(),
+            res_out.data_ptr(),
+            rows,
+            hidden,
+            _DTYPE_CODES[inp.dtype],
+            _DTYPE_CODES[weight.dtype],
+            float(weight_bias),
+            float(epsilon),
+        )
+        if rc == -1:
+            return None
+        if rc != 0:
+            raise RuntimeError(f"xpu_p2p_ar_fused_add_rms_norm failed ({rc})")
+        return out, res_out
 
     def timeouts(self) -> int:
         """Polls that gave up waiting for a peer (should be 0). Synchronizes."""

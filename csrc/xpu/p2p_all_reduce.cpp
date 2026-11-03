@@ -81,7 +81,8 @@ struct State {
   uint64_t *recv[kMaxWorld] = {};  // [rank] = own buffer, others = IPC-mapped peers
   bool mapped[kMaxWorld] = {};
   int peer_fd[kMaxWorld];
-  uint64_t *ctl = nullptr;  // own device memory: [0] calls done, [1] current call, [2] timeouts
+  uint64_t *ctl = nullptr;  // own device memory: [0] calls done, [1] current call, [2] timeouts,
+                            // [kScratch..] fused-norm partials
   ze_context_handle_t zctx = nullptr;
   ze_device_handle_t zdev = nullptr;
   sycl::context *ctx = nullptr;
@@ -238,6 +239,200 @@ void launch_reduce(sycl::queue &q, const State &s, const uint32_t *in, uint32_t 
   });
 }
 
+// ---------------------------------------------------------------------------
+// All-reduce fused with the residual add and RMSNorm that follow it in most
+// transformer layers (vllm_ir fused_add_rms_norm), for a [rows, hidden] input:
+//   ar      = all_reduce(in), rounded to the model dtype
+//   s       = float(ar) + float(residual)          (fp32)
+//   res_out = s rounded to the model dtype
+//   y       = s * rsqrt(mean(s^2) + eps)
+//   out     = y * (weight + bias), with y first rounded to the model dtype when
+//             the weight is in the model dtype (bias 0), as the IR op does.
+// Gemma-style norms pass the raw weight with bias 1 (weight.float() + 1).
+// One work-group per row: it polls/sums the row's LL words, keeps the sums in
+// registers, reduces the sum of squares over the group and writes both outputs.
+// LL words that straddle two rows are read by both groups (reads only).
+// A row gets up to kFusedMaxGPR work-groups (one group per row left the whole
+// poll to a single Xe core and was ~6 us slower). The groups of a row combine
+// their sums of squares through tagged partials in ctl[kScratch..]: each group
+// stores (call tag << 32 | partial) and polls its row's partials until all carry
+// this call's tag, then adds them in group order, so all groups and all ranks
+// get the same total. Tags make resets unnecessary.
+constexpr int kFusedWG = 256;
+constexpr int kFusedMaxGPR = 8;
+constexpr int kFusedMaxRows = 32;
+constexpr int kFusedMaxLL = 4;  // LL words per work-item
+constexpr size_t kScratch = 8;  // ctl[8..] = partials [row][group]
+constexpr size_t kCtlWords = kScratch + size_t(kFusedMaxRows) * kFusedMaxGPR;
+
+template <int DT>
+inline float round_dt(float v) {
+  if constexpr (DT == kF16) return float(sycl::half(v));
+  else if constexpr (DT == kBF16) return sycl::bit_cast<float>(uint32_t(f2bf16(v)) << 16);
+  else return v;
+}
+
+template <int DT>
+inline float load_elem(const void *p, size_t e) {
+  if constexpr (DT == kF16) return float(static_cast<const sycl::half *>(p)[e]);
+  else if constexpr (DT == kBF16) return sycl::bit_cast<float>(uint32_t(static_cast<const uint16_t *>(p)[e]) << 16);
+  else return static_cast<const float *>(p)[e];
+}
+
+template <int DT>
+inline void store_elem(void *p, size_t e, float v) {
+  if constexpr (DT == kF16) static_cast<sycl::half *>(p)[e] = sycl::half(v);
+  else if constexpr (DT == kBF16) static_cast<uint16_t *>(p)[e] = f2bf16(v);
+  else static_cast<float *>(p)[e] = v;
+}
+
+template <int DT, int WDT>
+void launch_fused_add_rms(sycl::queue &q, const State &s, const uint32_t *in, const void *residual,
+                          const void *weight, void *out, void *res_out, size_t rows, size_t hidden,
+                          float bias, float eps, int last_peer, int gpr) {
+  constexpr int EPW = DT == kF32 ? 1 : 2;  // elements per 4-byte word
+  uint64_t *own = s.recv[s.rank];
+  uint64_t *ctl = s.ctl;
+  const int rank = s.rank, world = s.world;
+  const size_t slot = s.slot_words;
+  const size_t wpr = hidden / EPW;  // words per row
+  const size_t nw = rows * wpr;
+  const size_t nll = ll_words(nw);
+  const bool round_x = bias == 0.f && WDT != kF32;
+  uint64_t *peer_buf = last_peer >= 0 ? s.recv[last_peer] : nullptr;
+  const size_t ipr = size_t(gpr) * kFusedWG;  // work-items per row
+  q.parallel_for(sycl::nd_range<1>(rows * ipr, kFusedWG), [=](sycl::nd_item<1> it) {
+    const size_t g = it.get_global_id(0), G = it.get_global_range(0);
+    const uint64_t n = ctl[1];
+    const uint32_t tag = call_tag(n);
+    if (peer_buf) {  // merged last push, grid-stride over the whole message
+      uint64_t *dst = peer_buf + (size_t(n & 1) * world + rank) * slot;
+      for (size_t j = g; j < nll; j += G) put_ll(dst, in, nw, j, tag);
+    }
+    const uint64_t *base = own + size_t(n & 1) * world * slot;
+    const size_t grp = it.get_group(0), row = grp / gpr, gi = grp % gpr;
+    const size_t lid = it.get_local_id(0), qi = gi * kFusedWG + lid;
+    const size_t w_lo = row * wpr, w_hi = w_lo + wpr;  // this row's words
+    const size_t j_lo = w_lo / 3, j_hi = (w_hi + 2) / 3;
+    float sv[kFusedMaxLL][6];
+    float sq = 0.f;
+#pragma unroll
+    for (int t = 0; t < kFusedMaxLL; t++) {
+      const size_t j = j_lo + qi + size_t(t) * ipr;
+      if (j >= j_hi) break;
+      const size_t b = 3 * j;
+      float acc[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      for (int k = 0; k < world; k++) {
+        uint32_t w[3];
+        if (k == rank) {
+          w[0] = in[b];
+          w[1] = b + 1 < nw ? in[b + 1] : 0u;
+          w[2] = b + 2 < nw ? in[b + 2] : 0u;
+        } else {
+          uint64_t *p = const_cast<uint64_t *>(base + size_t(k) * slot + 2 * j);
+          a64sys hi(p[1]);
+          uint64_t h;
+          uint64_t spins = 0;
+          while (uint32_t((h = hi.load()) >> 32) != tag) {
+            if (++spins > kSpinLimit) {
+              a64dev(ctl[2]).fetch_add(1);
+              break;
+            }
+          }
+          const uint64_t l = a64sys(p[0]).load();
+          w[0] = uint32_t(l);
+          w[1] = uint32_t(l >> 32);
+          w[2] = uint32_t(h);
+        }
+#pragma unroll
+        for (int c = 0; c < 3; c++) {
+          float a, bb;
+          unpack<DT>(w[c], a, bb);
+          acc[2 * c] += a;
+          acc[2 * c + 1] += bb;
+        }
+      }
+#pragma unroll
+      for (int c = 0; c < 3; c++) {
+        const size_t word = b + c;
+        const bool mine = word >= w_lo && word < w_hi;
+#pragma unroll
+        for (int e = 0; e < EPW; e++) {
+          float v = 0.f;
+          if (mine) {
+            const size_t elem = word * EPW + e;  // flat element index
+            v = round_dt<DT>(acc[2 * c + e]) + load_elem<DT>(residual, elem);
+            sq += v * v;
+          }
+          sv[t][2 * c + e] = v;
+        }
+      }
+    }
+    const float part = sycl::reduce_over_group(it.get_group(), sq, sycl::plus<float>());
+    float total = 0.f;
+    if (lid == 0) {
+      uint64_t *pp = ctl + kScratch + row * gpr;
+      a64sys(pp[gi]).store(uint64_t(tag) << 32 | sycl::bit_cast<uint32_t>(part));
+      for (int k = 0; k < gpr; k++) {
+        a64sys a(pp[k]);
+        uint64_t v;
+        uint64_t spins = 0;
+        while (uint32_t((v = a.load()) >> 32) != tag) {
+          if (++spins > kSpinLimit) {
+            a64dev(ctl[2]).fetch_add(1);
+            break;
+          }
+        }
+        total += sycl::bit_cast<float>(uint32_t(v));
+      }
+    }
+    total = sycl::group_broadcast(it.get_group(), total, 0);
+    const float scale = sycl::rsqrt(total / float(hidden) + eps);
+#pragma unroll
+    for (int t = 0; t < kFusedMaxLL; t++) {
+      const size_t j = j_lo + qi + size_t(t) * ipr;
+      if (j >= j_hi) break;
+      const size_t b = 3 * j;
+#pragma unroll
+      for (int c = 0; c < 3; c++) {
+        const size_t word = b + c;
+        if (word < w_lo || word >= w_hi) continue;
+#pragma unroll
+        for (int e = 0; e < EPW; e++) {
+          const size_t elem = word * EPW + e;
+          const float v = sv[t][2 * c + e];
+          store_elem<DT>(res_out, elem, v);
+          float y = v * scale;
+          if (round_x) y = round_dt<DT>(y);
+          store_elem<DT>(out, elem, y * (load_elem<WDT>(weight, elem - row * hidden) + bias));
+        }
+      }
+    }
+    if (g == 0) ctl[0] = n;  // nobody in this kernel reads ctl[0]
+  });
+}
+
+template <int DT>
+void dispatch_fused(int wdtype, sycl::queue &q, const State &s, const uint32_t *in, const void *residual,
+                    const void *weight, void *out, void *res_out, size_t rows, size_t hidden, float bias,
+                    float eps, int last, int gpr) {
+  switch (wdtype) {
+    case kF16: launch_fused_add_rms<DT, kF16>(q, s, in, residual, weight, out, res_out, rows, hidden, bias, eps, last, gpr); break;
+    case kBF16: launch_fused_add_rms<DT, kBF16>(q, s, in, residual, weight, out, res_out, rows, hidden, bias, eps, last, gpr); break;
+    default: launch_fused_add_rms<DT, kF32>(q, s, in, residual, weight, out, res_out, rows, hidden, bias, eps, last, gpr); break;
+  }
+}
+
+// Enqueue the pushes of one call; returns the peer for the merged last push (or -1).
+int enqueue_pushes(sycl::queue &q, const State &s, const uint32_t *in, size_t nw) {
+  // Peers in ring order from this rank. With 3+ ranks the last push goes into the
+  // reduce kernel. With 2 ranks the only push must stay separate: it is the
+  // first push, which sets ctl[1] from ctl[0], and the reduce writes ctl[0].
+  const int separate = s.world > 2 && !g_no_merge ? s.world - 2 : s.world - 1;
+  for (int d = 1; d <= separate; d++) launch_push(q, s, (s.rank + d) % s.world, d == 1, in, nw);
+  return separate < s.world - 1 ? (s.rank + s.world - 1) % s.world : -1;
+}
+
 }  // namespace
 
 extern "C" {
@@ -280,9 +475,9 @@ void *xpu_p2p_ar_create(void *queue, int rank, int world, uint64_t max_bytes, ch
     }
     s->recv[rank] = static_cast<uint64_t *>(p);
     s->mapped[rank] = true;
-    s->ctl = sycl::malloc_device<uint64_t>(4, q);
+    s->ctl = sycl::malloc_device<uint64_t>(kCtlWords, q);
     q.memset(s->recv[rank], 0, s->buf_bytes);
-    q.memset(s->ctl, 0, 4 * sizeof(uint64_t));
+    q.memset(s->ctl, 0, kCtlWords * sizeof(uint64_t));
     q.wait_and_throw();
     return s;
   } catch (const std::exception &e) {
@@ -378,17 +573,42 @@ int xpu_p2p_ar_all_reduce(void *state, void *queue, const void *in, void *out, u
   sycl::queue &q = *static_cast<sycl::queue *>(queue);
   const uint32_t *I = static_cast<const uint32_t *>(in);
   uint32_t *O = static_cast<uint32_t *>(out);
-  // Peers in ring order from this rank. With 3+ ranks the last push goes into the
-  // reduce kernel. With 2 ranks the only push must stay separate: it is the
-  // first push, which sets ctl[1] from ctl[0], and the reduce writes ctl[0].
-  const int separate = s->world > 2 && !g_no_merge ? s->world - 2 : s->world - 1;
-  for (int d = 1; d <= separate; d++) launch_push(q, *s, (s->rank + d) % s->world, d == 1, I, nw);
-  const int last = separate < s->world - 1 ? (s->rank + s->world - 1) % s->world : -1;
+  if (dtype < kF16 || dtype > kF32) return -2;
+  const int last = enqueue_pushes(q, *s, I, nw);
   switch (dtype) {
     case kF16: launch_reduce<kF16>(q, *s, I, O, nw, last); break;
     case kBF16: launch_reduce<kBF16>(q, *s, I, O, nw, last); break;
-    case kF32: launch_reduce<kF32>(q, *s, I, O, nw, last); break;
-    default: return -2;
+    default: launch_reduce<kF32>(q, *s, I, O, nw, last); break;
+  }
+  return 0;
+}
+
+// All-reduce of in[rows, hidden] fused with residual add + RMSNorm (see
+// launch_fused_add_rms). out and res_out are new [rows, hidden] tensors of the
+// same dtype; residual is not modified. weight has `hidden` elements of
+// wdtype. Returns -1 for sizes this path can't take (caller falls back).
+int xpu_p2p_ar_fused_add_rms_norm(void *state, void *queue, const void *in, const void *residual,
+                                  const void *weight, void *out, void *res_out, uint64_t rows,
+                                  uint64_t hidden, int dtype, int wdtype, float bias, float eps) {
+  State *s = static_cast<State *>(state);
+  if (dtype < kF16 || dtype > kF32 || wdtype < kF16 || wdtype > kF32) return -2;
+  const size_t esz = dtype == kF32 ? 4 : 2;
+  const size_t row_bytes = size_t(hidden) * esz;
+  const size_t nw = size_t(rows) * row_bytes / 4;
+  if (rows == 0 || hidden == 0 || row_bytes % 4 || nw > s->max_words) return -1;
+  // LL words a row's work-items cover (rows don't start on LL word boundaries)
+  const size_t ll_row = row_bytes / 4 / 3 + 2;
+  const int gpr = int(std::min<size_t>(kFusedMaxGPR, (ll_row + kFusedWG - 1) / kFusedWG));
+  // All groups spin on each other, so they must all be resident: keep it small.
+  if (rows > size_t(kFusedMaxRows) || rows * gpr > 128 || ll_row > size_t(gpr) * kFusedWG * kFusedMaxLL)
+    return -1;
+  sycl::queue &q = *static_cast<sycl::queue *>(queue);
+  const uint32_t *I = static_cast<const uint32_t *>(in);
+  const int last = enqueue_pushes(q, *s, I, nw);
+  switch (dtype) {
+    case kF16: dispatch_fused<kF16>(wdtype, q, *s, I, residual, weight, out, res_out, rows, hidden, bias, eps, last, gpr); break;
+    case kBF16: dispatch_fused<kBF16>(wdtype, q, *s, I, residual, weight, out, res_out, rows, hidden, bias, eps, last, gpr); break;
+    default: dispatch_fused<kF32>(wdtype, q, *s, I, residual, weight, out, res_out, rows, hidden, bias, eps, last, gpr); break;
   }
   return 0;
 }

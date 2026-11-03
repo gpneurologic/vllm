@@ -37,6 +37,141 @@ def _expected(world: int, step: int, numel: int, dtype: torch.dtype) -> torch.Te
     return acc.to(dtype)
 
 
+def _ref_fused_add_rms_norm(ar_out, residual, weight, eps, bias):
+    """vllm/ir/ops/layernorm.py fused_add_rms_norm, with weight + bias as the
+    weight (Gemma norms pass weight.float() + 1, i.e. an fp32 weight)."""
+    w = weight.float() + bias if bias else weight
+    orig = ar_out.dtype
+    x = ar_out.float() + residual.float()
+    new_res = x.to(orig)
+    x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+    x = x.to(w.dtype) * w
+    return x.to(orig), new_res
+
+
+def _test_fused(rank, world, args, ar, dev, cpu_group, errors) -> None:
+    eps = 1e-6
+    tol = {
+        torch.float16: (1e-2, 2e-3),
+        torch.bfloat16: (5e-2, 1.6e-2),
+        torch.float32: (1e-5, 1e-5),
+    }
+    for dtype in DTYPES:
+        esz = torch.tensor([], dtype=dtype).element_size()
+        for gemma in (False, True):
+            bias = 1.0 if gemma else 0.0
+            g = torch.Generator().manual_seed(4242 + DTYPES.index(dtype))
+            weight = (torch.randn(HIDDEN, generator=g) * (0.1 if gemma else 1)).to(dtype)
+            weight_d = weight.to(dev)
+            for rows in (1, 2, 3, 5, 12, 14):
+                if rows * HIDDEN * esz > ar.max_bytes:
+                    continue
+                outs = []
+                for step in range(20):
+                    s = 50_000 + step * 31 + rows
+                    x = _input(rank, s, rows * HIDDEN, dtype).view(rows, HIDDEN)
+                    res = _input(0, s + 7, rows * HIDDEN, dtype).view(rows, HIDDEN)
+                    r = ar.fused_add_rms_norm(
+                        x.to(dev), res.to(dev), weight_d, eps, bias
+                    )
+                    if r is None:
+                        errors.append(f"rank {rank}: fused path refused rows={rows}")
+                        return
+                    outs.append((s, res, r))
+                torch.xpu.synchronize()
+                for s, res, (out, new_res) in outs:
+                    exp_ar = _expected(world, s, rows * HIDDEN, dtype).view(rows, HIDDEN)
+                    exp_out, exp_res = _ref_fused_add_rms_norm(
+                        exp_ar, res, weight, eps, bias
+                    )
+                    name = f"fused {dtype} gemma={gemma} rows={rows} step={s}"
+                    if not torch.equal(new_res.cpu(), exp_res):
+                        errors.append(f"rank {rank}: {name}: residual differs")
+                    atol, rtol = tol[dtype]
+                    if not torch.allclose(
+                        out.cpu().float(), exp_out.float(), atol=atol, rtol=rtol
+                    ):
+                        d = (out.cpu().float() - exp_out.float()).abs().max()
+                        errors.append(f"rank {rank}: {name}: out max diff {d:.3g}")
+            if rank == 0:
+                print(f"  fused ok: {dtype} gemma={gemma}", flush=True)
+
+    # graph replay of the fused path
+    dtype, rows = torch.float16, 3
+    weight = torch.randn(HIDDEN, dtype=dtype)
+    static_x = torch.zeros(rows, HIDDEN, dtype=dtype, device=dev)
+    static_r = torch.zeros(rows, HIDDEN, dtype=dtype, device=dev)
+    weight_d = weight.to(dev)
+    torch.xpu.synchronize()
+    dist.barrier(group=cpu_group)
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        g_out, g_res = ar.fused_add_rms_norm(static_x, static_r, weight_d, eps, 1.0)
+    torch.xpu.synchronize()
+    dist.barrier(group=cpu_group)
+    for s in range(70_000, 70_000 + args.replays):
+        res = _input(0, s + 7, rows * HIDDEN, dtype).view(rows, HIDDEN)
+        static_x.copy_(_input(rank, s, rows * HIDDEN, dtype).view(rows, HIDDEN).to(dev))
+        static_r.copy_(res.to(dev))
+        graph.replay()
+        torch.xpu.synchronize()
+        exp_ar = _expected(world, s, rows * HIDDEN, dtype).view(rows, HIDDEN)
+        exp_out, exp_res = _ref_fused_add_rms_norm(exp_ar, res, weight, eps, 1.0)
+        if not torch.equal(g_res.cpu(), exp_res) or not torch.allclose(
+            g_out.cpu().float(), exp_out.float(), atol=1e-2, rtol=2e-3
+        ):
+            errors.append(f"rank {rank}: fused graph step={s} wrong")
+            break
+    if rank == 0:
+        print(f"  fused graph ok: replays={args.replays}", flush=True)
+    del graph
+
+    if args.bench:
+        norm = torch.compile(
+            lambda a, r, w: _ref_fused_add_rms_norm(a, r, w, eps, 1.0), dynamic=False
+        )
+        for tokens in args.bench_tokens:
+            if tokens * HIDDEN * 2 > ar.max_bytes:
+                continue
+            x = torch.randn(tokens, HIDDEN, dtype=torch.float16, device=dev)
+            r = torch.randn(tokens, HIDDEN, dtype=torch.float16, device=dev)
+            w = torch.randn(HIDDEN, dtype=torch.float16, device=dev)
+            # Device time, as in vLLM's recorded graphs: capture 100 calls in
+            # one XPU graph and time replays (host overhead drops out).
+            res = {}
+            for name, fn in (
+                ("ar", lambda: ar.all_reduce(x)),
+                ("fused", lambda: ar.fused_add_rms_norm(x, r, w, eps, 1.0)),
+                ("split", lambda: norm(ar.all_reduce(x), r, w)),
+            ):
+                for _ in range(5):
+                    fn()
+                torch.xpu.synchronize()
+                dist.barrier(group=cpu_group)
+                graph = torch.xpu.XPUGraph()
+                with torch.xpu.graph(graph):
+                    for _ in range(100):
+                        fn()
+                torch.xpu.synchronize()
+                times = []
+                for _ in range(7):
+                    dist.barrier(group=cpu_group)
+                    t0 = time.perf_counter()
+                    for _ in range(5):
+                        graph.replay()
+                    torch.xpu.synchronize()
+                    times.append((time.perf_counter() - t0) / 500 * 1e6)
+                res[name] = statistics.median(times)
+                del graph
+            if rank == 0:
+                print(
+                    f"  bench graph {tokens:2d} tok: p2p AR {res['ar']:5.1f} us"
+                    f"  AR+compiled norm {res['split']:5.1f} us"
+                    f"  fused {res['fused']:5.1f} us",
+                    flush=True,
+                )
+
+
 def _worker(rank: int, world: int, args, port: int, fails) -> None:
     from vllm.distributed.device_communicators.xpu_p2p_all_reduce import (
         XpuP2PAllReduce,
@@ -119,6 +254,8 @@ def _worker(rank: int, world: int, args, port: int, fails) -> None:
                 f"  graph ok: {dtype} numel={numel} replays={args.replays}", flush=True
             )
         del graph
+
+    _test_fused(rank, world, args, ar, dev, cpu_group, errors)
 
     timeouts = ar.timeouts()
     if timeouts:
