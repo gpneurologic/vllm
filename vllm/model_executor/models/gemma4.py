@@ -2970,6 +2970,14 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        # Cache each layer's scalar on the host now. The forward reads it with
+        # .item() the first time; under torch.compile that check is traced and the
+        # .item() then runs on every call, which breaks XPU graph capture.
+        for layer in getattr(self, "layers", []):
+            scalar = getattr(layer, "layer_scalar", None)
+            if isinstance(scalar, torch.Tensor) and hasattr(layer, "_layer_scalar_host"):
+                layer._layer_scalar_host = float(scalar.item())
+
         return loaded_params
 
 

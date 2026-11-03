@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pad Qwen3.5/3.8 models at load time so tensor parallelism can split them.
+"""Pad Qwen3.5/3.8 and dense Gemma 4 models at load time so tensor parallelism
+can split them.
+
+Gemma 4 (e.g. 31B: 32 query heads, 16 KV heads on sliding layers, 4 KV heads
+of size 512 on full-attention layers) gets one padded query-head count that
+keeps whole KV groups for both layer types (TP=3: 48 query, 24 and 6 KV
+heads). Its q/k norms are per head and its V norm has no weight, so zero
+dummy heads stay zero. The Qwen layout follows.
 
 Every dimension vLLM splits across GPUs must divide by the TP size. Qwen3.8-27B
 has 4 KV heads, 16 linear-attention key heads and an MLP of 17408, so it can't
@@ -47,7 +54,7 @@ TAG = "TP padding"
 PLAN_ATTR = "vllm_tp_pad_plan"
 ALIGN = 128  # MLP / per-GPU alignment: FP8 blocks, GPTQ groups (<=128) and packing
 # Text configs this padding knows the weight layout of (dense Qwen3.5/3.8).
-MODEL_TYPES = ("qwen3_5_text",)
+MODEL_TYPES = ("qwen3_5_text", "gemma4_text")
 
 _TEXT_KEYS = (
     "num_attention_heads",
@@ -181,6 +188,8 @@ def maybe_pad_config(hf_config: Any, hf_text_config: Any, tp: int | None = None)
         return
     if getattr(hf_text_config, "model_type", None) not in MODEL_TYPES:
         return
+    if hf_text_config.model_type == "gemma4_text":
+        return _pad_config_gemma4(hf_config, hf_text_config, tp)
     if any(getattr(hf_text_config, k, None) is None for k in _TEXT_KEYS):
         return
     c = {k: int(getattr(hf_text_config, k)) for k in _TEXT_KEYS}
@@ -223,7 +232,7 @@ def maybe_pad_config(hf_config: Any, hf_text_config: Any, tp: int | None = None)
         if v % unit:
             raise ValueError(f"{TAG} for TP={tp}: {name} per GPU ({v}) is not a multiple of {unit}")
     plan = dict(
-        tp=tp, H=H, H2=H2, KV=KV, KV2=KV2, D=D, gate=gate, LK=LK, LK2=LK2,
+        arch="qwen3_5", tp=tp, H=H, H2=H2, KV=KV, KV2=KV2, D=D, gate=gate, LK=LK, LK2=LK2,
         LV=LV, LV2=LV2, DK=DK, DV=DV, I=inter, I2=inter2, block=block, group=group,
         int4=info["int4"], zero_offset=info["zero_offset"], dequant_ba=dequant_ba,
     )
@@ -243,6 +252,67 @@ def maybe_pad_config(hf_config: Any, hf_text_config: Any, tp: int | None = None)
             "%s: linear_attn.in_proj_a/b (%d value heads per GPU) can't be split in whole "
             "4-bit words; serving them unquantized", TAG, LV2 // tp,
         )
+
+
+def _pad_config_gemma4(hf_config: Any, hf_text_config: Any, tp: int) -> None:
+    """Gemma 4 (dense): sliding layers have ``num_key_value_heads`` KV heads of
+    ``head_dim``; full-attention layers have ``global_head_dim`` heads and, with
+    ``attention_k_eq_v``, ``num_global_key_value_heads`` KV heads (K is also V).
+    All layers share ``num_attention_heads`` query heads, so one padded query
+    count must keep whole KV groups for both layer types."""
+    t = hf_text_config
+    if getattr(t, "enable_moe_block", False) or getattr(t, "num_experts", None):
+        return  # MoE variants: not handled here; vLLM's own checks report it
+    H = int(t.num_attention_heads)
+    KVs = int(t.num_key_value_heads)
+    D = int(t.head_dim)
+    Dg = int(getattr(t, "global_head_dim", None) or D)
+    k_eq_v = bool(getattr(t, "attention_k_eq_v", False))
+    KVg = int(getattr(t, "num_global_key_value_heads", None) or KVs) if k_eq_v else KVs
+    inter = int(t.intermediate_size)
+    layer_types = list(getattr(t, "layer_types", None) or [])
+    if not layer_types or H % KVs or H % KVg:
+        return
+    groups = {H // KVs, H // KVg}
+    H2 = H
+    while H2 % tp or any(H2 % g or (H2 // g) % tp for g in groups):
+        H2 += 1
+    KVs2, KVg2 = H2 // (H // KVs), H2 // (H // KVg)
+    info = _quant_info(hf_config)
+    block, group = info["block"], info["group"]
+    unit = math.lcm(ALIGN, block or 1, group or 1)
+    inter2 = inter if inter % (tp * unit) == 0 else _round_up(inter, tp * unit)
+    if (H2, KVs2, KVg2, inter2) == (H, KVs, KVg, inter):
+        return
+    if info["unsupported"]:
+        raise ValueError(
+            f"{TAG}: this model doesn't split across {tp} GPUs and would need padding, "
+            f"but its weight format isn't supported for that ({info['unsupported']}). "
+            "Use a TP size that divides it, or a pre-padded checkpoint."
+        )
+    for name, v in (
+        ("q rows", H2 * D // tp), ("global q rows", H2 * Dg // tp),
+        ("kv rows", KVs2 * D // tp), ("global kv rows", KVg2 * Dg // tp),
+        ("mlp", inter2 // tp),
+    ):
+        if v % unit:
+            raise ValueError(f"{TAG} for TP={tp}: {name} per GPU ({v}) is not a multiple of {unit}")
+    plan = dict(
+        arch="gemma4", tp=tp, H=H, H2=H2, KVs=KVs, KVs2=KVs2, KVg=KVg, KVg2=KVg2, D=D, Dg=Dg,
+        k_eq_v=k_eq_v, layer_types=layer_types, I=inter, I2=inter2, block=block, group=group,
+        int4=info["int4"], zero_offset=info["zero_offset"], dequant_ba=False,
+    )
+    t.num_attention_heads = H2
+    t.num_key_value_heads = KVs2
+    if k_eq_v:
+        t.num_global_key_value_heads = KVg2
+    t.intermediate_size = inter2
+    setattr(t, PLAN_ATTR, plan)
+    logger.info(
+        "%s: TP=%d doesn't divide the model, padding it while loading: query heads %d->%d, "
+        "KV heads %d->%d, global KV heads %d->%d, MLP %d->%d",
+        TAG, tp, H, H2, KVs, KVs2, KVg, KVg2, inter, inter2,
+    )
 
 
 def pick_mm_encoder_tp_mode(hf_config: Any, requested: str | None) -> str | None:
@@ -274,6 +344,8 @@ def _rules(p: dict) -> list[tuple[str, str, list[tuple[int, int]]]]:
     """(regex on the parameter name without its suffix, 'out' | 'in', segments).
     'out' pads output channels (rows of an nn.Linear weight), 'in' pads input
     channels. Each (old, new) segment is padded at its end."""
+    if p.get("arch") == "gemma4":
+        return _rules_gemma4(p)
     H, H2, KV, KV2, D, g = p["H"], p["H2"], p["KV"], p["KV2"], p["D"], p["gate"]
     LK, LK2, LV, LV2, DK, DV = p["LK"], p["LK2"], p["LV"], p["LV2"], p["DK"], p["DV"]
     lin_qkv = [(LK * DK, LK2 * DK), (LK * DK, LK2 * DK), (LV * DV, LV2 * DV)]
@@ -290,6 +362,29 @@ def _rules(p: dict) -> list[tuple[str, str, list[tuple[int, int]]]]:
         (r"\.mlp\.(gate|up)_proj$", "out", [(p["I"], p["I2"])]),
         (r"\.mlp\.down_proj$", "in", [(p["I"], p["I2"])]),
     ]
+
+
+def _rules_gemma4(p: dict) -> list[tuple[str, str, list[tuple[int, int]]]]:
+    """Per-layer rules: sliding and full-attention layers differ in head size and
+    KV heads. Only the language model's layers (not the vision tower)."""
+    H, H2 = p["H"], p["H2"]
+    rules = []
+    for i, lt in enumerate(p["layer_types"]):
+        full = lt == "full_attention"
+        d = p["Dg"] if full else p["D"]
+        kv, kv2 = (p["KVg"], p["KVg2"]) if full and p["k_eq_v"] else (p["KVs"], p["KVs2"])
+        pre = rf"language_model\.(?:model\.)?layers\.{i}\.self_attn\."
+        rules += [
+            (pre + r"q_proj$", "out", [(H * d, H2 * d)]),
+            (pre + r"[kv]_proj$", "out", [(kv * d, kv2 * d)]),
+            (pre + r"o_proj$", "in", [(H * d, H2 * d)]),
+        ]
+    if p["I2"] != p["I"]:
+        rules += [
+            (r"language_model\.(?:model\.)?layers\.\d+\.mlp\.(gate|up)_proj$", "out", [(p["I"], p["I2"])]),
+            (r"language_model\.(?:model\.)?layers\.\d+\.mlp\.down_proj$", "in", [(p["I"], p["I2"])]),
+        ]
+    return rules
 
 
 _SUFFIXES = (
