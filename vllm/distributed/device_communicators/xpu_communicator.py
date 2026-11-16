@@ -71,6 +71,19 @@ class XpuCommunicator(DeviceCommunicatorBase):
             # and accumulate in rank order, independent of the token batch.
             return self._fixed_rank_sum(input_)
 
+        # oneCCL's ring all-reduce splits a message into world_size equal parts
+        # and hands the remainder to an Arc kernel that throws "We only support
+        # aligned pointer for now" (oneCCL 2021.15). At TP=2 hidden-size tensors
+        # always divide evenly; at TP=3 they usually don't. Reduce a zero-padded
+        # copy instead; the padding doesn't change the sum.
+        quantum = self.world_size * 64
+        numel = input_.numel()
+        if numel % quantum:
+            padded = input_.new_zeros(numel + (-numel) % quantum)
+            padded[:numel].copy_(input_.reshape(-1))
+            dist.all_reduce(padded, group=self.device_group)
+            return padded[:numel].view(input_.shape)
+
         output = input_.clone()
         dist.all_reduce(output, group=self.device_group)
         return output
