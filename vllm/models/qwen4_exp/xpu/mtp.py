@@ -153,6 +153,16 @@ def _make_draft_vllm_config(
                 "quantized_layers",
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
+        # AutoGPTQ lists quantized modules by checkpoint name (`mtp.layers.0...`);
+        # the standalone draft model numbers its layer after the main ones.
+        gptq_modules = getattr(draft_quant_config, "modules_in_block_to_quantize", None)
+        if gptq_modules and not getattr(draft_quant_config, "_mtp_remapped", False):
+            setattr(  # noqa: B010
+                draft_quant_config,
+                "modules_in_block_to_quantize",
+                _remap_ignored_layers(gptq_modules, mtp_start_layer_idx),
+            )
+            setattr(draft_quant_config, "_mtp_remapped", True)  # noqa: B010
         if draft_quant_config.get_name() == "quark":
             draft_quant_config.apply_vllm_mapper(
                 WeightsMapper(
