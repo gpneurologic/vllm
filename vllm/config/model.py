@@ -874,6 +874,12 @@ class ModelConfig:
 
         # Init multimodal config if needed
         if self._model_info.supports_multimodal:
+            from vllm.transformers_utils.tp_pad import pick_mm_encoder_tp_mode
+
+            # A vision encoder whose heads don't divide by TP runs whole per GPU.
+            mm_encoder_tp_mode = pick_mm_encoder_tp_mode(
+                self.hf_config, mm_encoder_tp_mode
+            )
             self.hf_image_processor_config = get_hf_image_processor_config(
                 self.model, hf_token=self.hf_token, revision=self.revision
             )

@@ -110,10 +110,14 @@ def _should_replicate_misaligned_shared_expert(
     enable_expert_parallel: bool,
     is_sequence_parallel: bool,
 ) -> bool:
-    if intermediate_size <= 0 or group_size is None:
+    if intermediate_size <= 0:
         return False
 
     partition_size, remainder = divmod(intermediate_size, tp_size)
+    if group_size is None:
+        # No group constraint: replicate only a width TP cannot split at all
+        # (e.g. 640 at TP=3), and only where the replicated path exists.
+        return remainder != 0 and (enable_expert_parallel or is_sequence_parallel)
     if remainder == 0 and partition_size % group_size == 0:
         return False
 

@@ -223,10 +223,17 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             # embedding, fc_hidden (shared across HC branches) projects the
             # backbone hidden; the embedding is added as a residual to every
             # branch (see mtp_residual_linear_shared.md).
+            # Both gather their output, so every rank holds the full result
+            # anyway: keep them whole on every rank when the hidden size does
+            # not divide by the TP size (2560 at TP=3).
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            fc_split = self.hidden_size % get_tensor_model_parallel_world_size() == 0
             self.fc_embedding = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
-                gather_output=True,
+                gather_output=fc_split,
+                disable_tp=not fc_split,
                 bias=False,
                 return_bias=False,
                 quant_config=draft_vllm_config.quant_config,
@@ -235,7 +242,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.fc_hidden = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
-                gather_output=True,
+                gather_output=fc_split,
+                disable_tp=not fc_split,
                 bias=False,
                 return_bias=False,
                 quant_config=draft_vllm_config.quant_config,
