@@ -49,6 +49,9 @@ from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
     _EXTRA_WEIGHTS_MAPPER,
+    _dequantize_gptq_lm_head,
+    _dequantize_hybrid_block_fp8,
+    is_fp8_quant_config,
     _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
@@ -472,7 +475,18 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(remap_weight_names(), mapper=mapper)
+        remapped: Iterable[tuple[str, torch.Tensor]] = remap_weight_names()
+        # Hybrid AutoRound checkpoints: see the same handling in model.py.
+        if not is_fp8_quant_config(self.quant_config):
+            remapped = _dequantize_hybrid_block_fp8(remapped)
+        lm_head = getattr(self, "lm_head", None)
+        if not hasattr(lm_head, "qweight"):
+            remapped = _dequantize_gptq_lm_head(
+                remapped,
+                group_size=getattr(self.quant_config, "group_size", 128),
+                keep=lm_head is not None,
+            )
+        return loader.load_weights(remapped, mapper=mapper)
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]
