@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
+import os
+import re
 from collections.abc import Iterable
 from itertools import islice
 
@@ -68,6 +70,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.common.ops.sequence_parallel import sp_all_gather
+from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -84,6 +87,8 @@ from .qsa import Qwen4ExpQSAAttention
 
 # Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
 # TODO: Delete qwen_... once Transformers 5.18.0 is the minimum required version.
+logger = init_logger(__name__)
+
 _QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
 
 
@@ -260,6 +265,88 @@ def _dequantize_gptq_lm_head(
 
 def is_fp8_quant_config(quant_config: QuantizationConfig | None) -> bool:
     return type(quant_config).__name__ in ("Fp8Config", "DeepseekV4FP8Config")
+
+
+# Linears a hybrid AutoRound checkpoint stores as block FP8 (`weight` in
+# FP8-e4m3 plus one `weight_scale_inv` per 128x128 block), by runtime name.
+_HYBRID_FP8_LINEAR_RE = re.compile(
+    r"(?:^|\.)layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)"
+    r"|linear_attn\.(?:in_proj_qkvz|out_proj)"
+    r"|mlp\.shared_expert\.[a-z_]+)$"
+)
+
+
+class HybridBlockFp8Mixin:
+    """Serve the block-FP8 linears of a hybrid INT4 checkpoint as FP8.
+
+    The checkpoint's own config excludes those layers from GPTQ, which would
+    build them unquantized. This returns the block-FP8 linear method for them
+    and defers to the wrapped config for everything else.
+    """
+
+    _hybrid_fp8_config: QuantizationConfig
+
+    def get_quant_method(self, layer: nn.Module, prefix: str):
+        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+        if isinstance(layer, LinearBase) and _HYBRID_FP8_LINEAR_RE.search(prefix):
+            return Fp8LinearMethod(self._hybrid_fp8_config)
+        return super().get_quant_method(layer, prefix)  # type: ignore[misc]
+
+
+def _hybrid_gptq_config_cls() -> type:
+    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+
+    global _HybridAutoGPTQConfig
+    if _HybridAutoGPTQConfig is None:
+
+        class HybridAutoGPTQConfig(HybridBlockFp8Mixin, AutoGPTQConfig):
+            pass
+
+        _HybridAutoGPTQConfig = HybridAutoGPTQConfig
+    return _HybridAutoGPTQConfig
+
+
+_HybridAutoGPTQConfig: type | None = None
+
+
+def enable_hybrid_block_fp8(vllm_config: VllmConfig) -> bool:
+    """Replace the quant config with one serving native block FP8 for a hybrid checkpoint.
+
+    Returns whether the FP8 linears are served natively. Set
+    `VLLM_QWEN4_EXP_HYBRID_FP8=bf16` to convert them to BF16 at load instead.
+    """
+    quant_config = vllm_config.quant_config
+    if isinstance(quant_config, HybridBlockFp8Mixin):
+        return True
+    if quant_config is None or quant_config.get_name() != "auto_gptq":
+        return False
+    if os.environ.get("VLLM_QWEN4_EXP_HYBRID_FP8", "native") == "bf16":
+        return False
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+    model_config = vllm_config.model_config
+    metadata = get_safetensors_params_metadata(
+        model_config.model, revision=model_config.revision
+    )
+    if not any(
+        name.endswith(".weight_scale_inv")
+        and ".layers." in name
+        and not name.startswith("mtp.")
+        for name in metadata
+    ):
+        return False
+    hybrid_cls = _hybrid_gptq_config_cls()
+    hybrid_config = hybrid_cls.__new__(hybrid_cls)
+    hybrid_config.__dict__.update(quant_config.__dict__)
+    hybrid_config._hybrid_fp8_config = Fp8Config(
+        weight_block_size=[_HYBRID_FP8_BLOCK, _HYBRID_FP8_BLOCK]
+    )
+    vllm_config.quant_config = hybrid_config
+    logger.info("Hybrid checkpoint: serving block-FP8 linears natively")
+    return True
 
 
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
@@ -514,6 +601,7 @@ class Qwen4ExpModel(nn.Module):
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
+        enable_hybrid_block_fp8(vllm_config)
         self.quant_config = vllm_config.quant_config
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
@@ -711,7 +799,9 @@ class Qwen4ExpModel(nn.Module):
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        if not is_fp8_quant_config(self.quant_config):
+        if not is_fp8_quant_config(self.quant_config) and not isinstance(
+            self.quant_config, HybridBlockFp8Mixin
+        ):
             weights = _dequantize_hybrid_block_fp8(weights)
         weights = (
             (
