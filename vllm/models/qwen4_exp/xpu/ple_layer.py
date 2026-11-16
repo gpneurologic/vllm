@@ -286,6 +286,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if os.environ.get("VLLM_QWEN4_EXP_PLE_ZERO") == "1":
             logger.warning("DEBUG: Qwen4Exp PLE table replaced by zeros")
             embedding_cls = Qwen4ExpPLEZeroEmbedding
+        table_dir = os.environ.get("VLLM_QWEN4_EXP_PLE_TABLE_DIR")
+        if table_dir:
+            from functools import partial
+
+            from .ple_disk import Qwen4ExpPLEDiskEmbedding
+
+            embedding_cls = partial(Qwen4ExpPLEDiskEmbedding, table_dir=table_dir)
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
@@ -369,6 +376,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if not self.use_sequence_parallel:
             return output
         return self._sp_shard_embeddings(output)
+
+    def stage_disk_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Stage the rows of this step from a disk-backed table (outside any graph)."""
+        ngram_ids = ple_ngram_ids(
+            input_ids=input_ids.reshape(-1),
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            layer_multipliers=self.layer_multipliers,
+            ngram_heads_vocab_sizes=self.ngram_heads_vocab_sizes,
+            ngram_heads_offsets=self.ngram_heads_offsets,
+            eos_token_id=self.eos_token_id,
+            heads_per_ngram=self.heads_per_ngram,
+        )
+        self.ngram_embedding.stage(ngram_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""

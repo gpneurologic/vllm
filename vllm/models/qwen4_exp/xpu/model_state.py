@@ -100,11 +100,32 @@ class Qwen4ExpModelState(MambaHybridModelState):
         # Unused capacity must be zero-length requests; the replay searches the
         # whole buffer at the request count it was captured with.
         buffer[num_reqs_padded + 1 :].fill_(input_batch.num_tokens)
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
+        for module in self._disk_ple_modules():
+            module.stage_disk_rows(
+                input_batch.input_ids, query_start_loc, ngram_context
+            )
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
         return model_inputs
+
+    def _disk_ple_modules(self) -> list:
+        modules = getattr(self, "_disk_ple_cache", None)
+        if modules is None:
+            from .ple_disk import Qwen4ExpPLEDiskEmbedding
+
+            modules = [
+                m
+                for m in self.model.modules()
+                if hasattr(m, "stage_disk_rows")
+                and isinstance(
+                    getattr(m, "ngram_embedding", None), Qwen4ExpPLEDiskEmbedding
+                )
+            ]
+            self._disk_ple_cache = modules
+        return modules
 
     def prepare_dummy_inputs(
         self,
