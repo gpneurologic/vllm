@@ -693,7 +693,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             reduce_results=reduce_results,
         )
         self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
-        self._prefetch_stream: torch.cuda.Stream | None = None
+        self._prefetch_stream: "torch.cuda.Stream | None" = None
         self._prefetch_buffer: torch.Tensor | None = None
         self._prefetch_alloc_lock = threading.Lock()
         self._prefetch_rows = max_total_tokens * self.etp_data_parallel_size

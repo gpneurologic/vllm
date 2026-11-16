@@ -1725,8 +1725,8 @@ class Engram(nn.Module):
     training kernel).
     """
 
-    _prefetch_stream: torch.cuda.Stream | None = None
-    _prefetch_done: torch.cuda.Event | None = None
+    _prefetch_stream: "torch.cuda.Stream | None" = None
+    _prefetch_done: "torch.cuda.Event | None" = None
     _batch: EngramBatch | None = None
 
     def __init__(
@@ -1737,7 +1737,7 @@ class Engram(nn.Module):
         layer_hash_index: int,
         use_sequence_parallel: bool,
         prefix: str,
-        prefetch_stream: torch.cuda.Stream | None = None,
+        prefetch_stream: "torch.cuda.Stream | None" = None,
     ) -> None:
         super().__init__()
         # Layers sharing one stream serialize their offloaded lookups, so they
