@@ -226,8 +226,10 @@ class BaseRenderer(ABC, Generic[_T]):
         # Pool last: multimodal processors may add tokens while they are
         # created, and the pooled copies only see tokens added before this.
         if isinstance(self.tokenizer, HfTokenizer):
+            # renderer_num_workers copies, not one more: the pool deep-copies
+            # another on demand, and each copy holds the whole tokenizer.
             maybe_make_thread_pool(
-                self.tokenizer, config.model_config.renderer_num_workers + 1
+                self.tokenizer, config.model_config.renderer_num_workers
             )
 
     def _prepare_tokenizer(self, tokenizer: HfTokenizer) -> None:
