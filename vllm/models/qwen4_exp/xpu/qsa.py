@@ -11,6 +11,7 @@ from torch import nn
 from transformers import Qwen4ExpTextConfig
 
 from vllm import _custom_ops as ops
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -549,6 +550,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         return FullAttentionManager.layer_config(spec)
 
+    # Reads the current request metadata, so a breakable graph must run it live
+    # at every replay instead of recording it with the capture-time metadata
+    # (as the nvidia path does). Recorded, a real prefill replays the dummy
+    # capture batch's block tables and state slots.
+    @eager_break_during_capture
     def _run_qsa(
         self,
         hidden_states: torch.Tensor,

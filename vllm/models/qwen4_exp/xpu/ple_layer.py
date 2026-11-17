@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_etp_group, get_tp_group
 from vllm.forward_context import get_forward_context
@@ -713,6 +714,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 token_indices=non_spec_token_indices,
             )
 
+    # Reads the current request metadata, so a breakable graph must run it live
+    # at every replay instead of recording it with the capture-time metadata
+    # (as the nvidia path does). Recorded, a real prefill replays the dummy
+    # capture batch's block tables and state slots.
+    @eager_break_during_capture
     def _short_conv(
         self,
         inputs: torch.Tensor,
