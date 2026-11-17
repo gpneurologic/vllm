@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 import torch.distributed as dist
@@ -12,6 +13,19 @@ from vllm.logger import init_logger
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+# Opt-in: small all-reduces in the TP group go GPU to GPU over PCIe instead of
+# through oneCCL (see xpu_p2p_all_reduce.py). Messages above the limit, and all
+# other groups, stay on oneCCL.
+_P2P_ALL_REDUCE = os.environ.get("VLLM_XPU_P2P_ALLREDUCE", "0") == "1"
+# Break-even vs oneCCL at TP=3 on B70 is ~14 tokens of a 5120-wide fp16 model.
+_P2P_MAX_BYTES = int(os.environ.get("VLLM_XPU_P2P_ALLREDUCE_MAX_BYTES", str(140 * 1024)))
+# Messages oneCCL would need zero-padded (see all_reduce) cost it ~2x, so P2P
+# still wins up to a larger size for those.
+_P2P_PADDED_MAX_BYTES = max(
+    _P2P_MAX_BYTES,
+    int(os.environ.get("VLLM_XPU_P2P_ALLREDUCE_PADDED_MAX_BYTES", str(256 * 1024))),
+)
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
@@ -27,6 +41,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
             cpu_group, device, device_group, unique_name, use_all2all=use_all2all
         )
         self.ca_comm: None = None
+        self.p2p_ar = None
+        if _P2P_ALL_REDUCE and "tp" in unique_name and self.world_size > 1:
+            # Collective set-up: every rank of the group must reach this.
+            from .xpu_p2p_all_reduce import XpuP2PAllReduce
+
+            p2p_ar = XpuP2PAllReduce(
+                self.cpu_group, self.device, max_bytes=_P2P_PADDED_MAX_BYTES
+            )
+            self.p2p_ar = None if p2p_ar.disabled else p2p_ar
         if self.use_all2all:
             if self.all2all_backend in (
                 "naive",
@@ -76,8 +99,24 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # aligned pointer for now" (oneCCL 2021.15). At TP=2 hidden-size tensors
         # always divide evenly; at TP=3 they usually don't. Reduce a zero-padded
         # copy instead; the padding doesn't change the sum.
+        #
+        # Small messages take the P2P path when it is enabled. It handles any
+        # length, so they need no padding, and it gets a larger size limit for
+        # messages oneCCL would have to pad. The choice depends only on shape
+        # and dtype, so all ranks choose the same path. It never reduces in
+        # place: the vllm::all_reduce custom op is functional.
         quantum = self.world_size * 64
         numel = input_.numel()
+        p2p_ar = self.p2p_ar
+        if (
+            p2p_ar is not None
+            and not torch.compiler.is_compiling()
+            and p2p_ar.should_use(
+                input_,
+                _P2P_PADDED_MAX_BYTES if numel % quantum else _P2P_MAX_BYTES,
+            )
+        ):
+            return p2p_ar.all_reduce(input_, inplace=False)
         if numel % quantum:
             padded = input_.new_zeros(numel + (-numel) % quantum)
             padded[:numel].copy_(input_.reshape(-1))
@@ -313,3 +352,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
             hidden_states,
             is_sequence_parallel,
         )
+
+    def destroy(self):
+        if self.p2p_ar is not None:
+            self.p2p_ar.close()
+            self.p2p_ar = None
+        super().destroy()
