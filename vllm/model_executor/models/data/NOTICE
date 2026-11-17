@@ -1,0 +1,20 @@
+qwen3_5_draft_vocab_65536.npy
+==============================
+
+65,536 token ids (sorted int32) that the Qwen3.5/3.8 MTP draft may propose when
+VLLM_MTP_DRAFT_VOCAB=default (see vllm/model_executor/models/qwen3_5_mtp.py).
+The target model verifies every drafted token, so the list only affects speed
+(draft acceptance), never the generated text.
+
+Tokenizer: Qwen3.5+ (248,044 base tokens + 33 added; shared by Qwen3.5,
+Qwen3.8 27B and Qwen3.8 Flash Next). Do not use it with other tokenizers.
+
+Origin: draft_vocab_65536.npy from
+https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound (src/), itself
+derived from https://github.com/blazux/qwen3.8-Flash-DGX.
+Copyright 2026 blazux. Licensed under the Apache License, Version 2.0.
+Built with tools/build_draft_vocab.py from English and code text: tokens seen
+in the corpus ranked by count, every special/added token, the first 256 ids
+(byte fallbacks), then the lowest remaining ids. Text that is mostly CJK
+drafts less well with it; build a list from your own traffic with
+tools/build_draft_vocab.py and point VLLM_MTP_DRAFT_VOCAB at it.

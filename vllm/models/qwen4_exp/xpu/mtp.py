@@ -13,8 +13,10 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
     multi stream [T, hc_count*H] (fed to the next draft step).
 """
 
+import os
 from collections.abc import Iterable
 
+import numpy as np
 import regex as re
 import torch
 from torch import nn
@@ -22,6 +24,12 @@ from transformers import Qwen4ExpTextConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -56,6 +64,20 @@ from .model import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
+)
+
+logger = init_logger(__name__)
+
+# The bundled frequent-token list for the Qwen3.5+ tokenizer (see data/NOTICE).
+_DEFAULT_DRAFT_VOCAB = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "..",
+    "model_executor",
+    "models",
+    "data",
+    "qwen3_5_draft_vocab_65536.npy",
 )
 
 
@@ -452,6 +474,7 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        self._draft_vocab_setup()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -477,7 +500,114 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
+        if self._draft_weight is not None:
+            return self._draft_logits(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
+
+    # ---- Reduced-vocabulary draft head (VLLM_MTP_DRAFT_VOCAB=default|<ids.npy>) ----
+    # Ported from the dense branch's qwen3_5_mtp.py. The draft normally reads the
+    # whole 248k-row lm_head for every drafted token (4 times per step with MTP 4).
+    # With a list of frequent ids it scores only those rows; every other id gets
+    # -inf. The target still verifies every draft, so the output is unchanged; only
+    # the acceptance rate can move. The ids are split evenly across TP ranks (not by
+    # vocab shard: frequent ids cluster at the start of the vocabulary), and each
+    # rank keeps its rows, taken from the full lm_head.weight while it loads (this
+    # checkpoint's GPTQ head is dequantized to BF16 on the way in).
+    # VLLM_MTP_DRAFT_HEAD=fp8 keeps those rows in FP8 (per-row scale).
+    def _draft_vocab_setup(self) -> None:
+        self._draft_weight: torch.Tensor | None = None
+        self._draft_scale: torch.Tensor | None = None
+        path = os.environ.get("VLLM_MTP_DRAFT_VOCAB")
+        if not path or self.config.tie_word_embeddings:
+            return
+        if path == "default":
+            path = os.path.normpath(_DEFAULT_DRAFT_VOCAB)
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        ids = np.unique(np.load(path).astype(np.int64))
+        ids = ids[(ids >= 0) & (ids < self.config.vocab_size)]
+        per = -(-len(ids) // tp)
+        per = -(-per // 16) * 16
+        ids = np.concatenate([ids, np.repeat(ids[-1], per * tp - len(ids))])
+        self._draft_ids_np = ids[rank * per : (rank + 1) * per]
+        self._draft_ids_all = torch.from_numpy(ids)
+        self._draft_ids_local = torch.from_numpy(self._draft_ids_np)
+        self._draft_tp = tp
+        logger.info(
+            "MTP draft vocabulary: %d ids from %s, %d rows per rank",
+            len(np.unique(ids)),
+            path,
+            per,
+        )
+
+    def _draft_vocab_capture(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        if not hasattr(self, "_draft_ids_np"):
+            yield from weights
+            return
+        dtype = self.vllm_config.model_config.dtype
+        for name, weight in weights:
+            if name == "lm_head.weight" and self._draft_weight is None:
+                dev = next(self.model.parameters()).device
+                rows = weight.index_select(0, self._draft_ids_local.to(weight.device))
+                w = rows.to(device=dev, dtype=dtype).contiguous()
+                if os.environ.get("VLLM_MTP_DRAFT_HEAD", "").lower() == "fp8":
+                    from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (  # noqa: E501
+                        quantize_rows_fp8,
+                    )
+
+                    w, self._draft_scale = quantize_rows_fp8(w)
+                self._draft_weight = w
+                self._draft_ids_all = self._draft_ids_all.to(dev)
+                self._draft_ids_local = self._draft_ids_local.to(dev)
+                logger.info(
+                    "MTP draft head: %d rows x %d per rank (%s, %.0f MiB) instead of "
+                    "the full lm_head",
+                    w.shape[0],
+                    w.shape[1],
+                    "fp8" if self._draft_scale is not None else str(w.dtype),
+                    w.numel() * w.element_size() / 2**20,
+                )
+            yield name, weight
+
+    def _draft_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        w = self._draft_weight
+        assert w is not None
+        if self._draft_scale is not None:
+            from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
+                fp8_linear,
+            )
+
+            return fp8_linear(hidden_states, w, self._draft_scale)
+        return torch.nn.functional.linear(hidden_states.to(w.dtype), w)
+
+    def _draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        local = self._draft_local(hidden_states)
+        part = (
+            tensor_model_parallel_all_gather(local, dim=-1)
+            if self._draft_tp > 1
+            else local
+        )
+        full = part.new_full((part.shape[0], self.config.vocab_size), float("-inf"))
+        full.index_copy_(1, self._draft_ids_all, part)
+        return full
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy draft token ids, used with use_local_argmax_reduction."""
+        if self._draft_weight is None:
+            logits = self.compute_logits(hidden_states)
+            return logits.argmax(dim=-1)
+        local = self._draft_local(hidden_states)
+        vals, idx = local.max(dim=-1)
+        gid = self._draft_ids_local[idx]
+        if self._draft_tp == 1:
+            return gid
+        pair = torch.stack([vals.float(), gid.float()], dim=-1)  # [T, 2]
+        allp = tensor_model_parallel_all_gather(pair, dim=-1)  # [T, 2*tp]
+        allp = allp.view(allp.shape[0], self._draft_tp, 2)
+        best = allp[..., 0].argmax(dim=-1, keepdim=True)
+        return allp[..., 1].gather(1, best).squeeze(1).long()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
@@ -504,7 +634,14 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
                 group_size=getattr(self.quant_config, "group_size", 128),
                 keep=lm_head is not None,
             )
-        return loader.load_weights(remapped, mapper=mapper)
+        loaded = loader.load_weights(self._draft_vocab_capture(remapped), mapper=mapper)
+        if os.environ.get("VLLM_MTP_FP8", "0") == "1":
+            from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
+                convert_unquantized_linears_fp8,
+            )
+
+            convert_unquantized_linears_fp8(self.model, "MTP draft layer")
+        return loaded
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

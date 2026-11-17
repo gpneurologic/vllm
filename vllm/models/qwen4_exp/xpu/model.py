@@ -211,6 +211,19 @@ def _dequantize_hybrid_block_fp8(
         )
 
 
+def _maybe_lm_head_fp8(model: nn.Module) -> None:
+    """VLLM_XPU_LM_HEAD_FP8=1: the target lm_head in FP8 weight-only (per-row
+    scale, oneDNN fp8_gemm_w8a16). Halves its reads; changes logits slightly."""
+    import os
+
+    if os.environ.get("VLLM_XPU_LM_HEAD_FP8", "0") == "1":
+        from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
+            convert_lm_head_fp8,
+        )
+
+        convert_lm_head_fp8(model)
+
+
 def _dequantize_gptq_lm_head(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
@@ -1077,7 +1090,9 @@ class Qwen4ExpForCausalLM(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        _maybe_lm_head_fp8(self)
+        return loaded
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -1285,7 +1300,9 @@ class Qwen4ExpForConditionalGeneration(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        _maybe_lm_head_fp8(self)
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(
