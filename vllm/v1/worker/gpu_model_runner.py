@@ -966,7 +966,21 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # Mamba "align" mode keeps accepted-token counts per request, not per
+        # batch row. The device-to-host copy of the counts lands asynchronously
+        # and in the row order of the step that produced it, while InputBatch
+        # adds, condenses and swaps rows for the next step in the meantime. A
+        # row-indexed CPU mirror can then hand one request's count to another
+        # (wrong state slot on decode, wrong state copy at a block boundary,
+        # which prefix caching then keeps). The copy goes to a private staging
+        # tensor and is resolved by request id in _prepare_inputs.
+        self._accepted_staging_cpu: torch.Tensor | None = None
+        self._accepted_staging_req_ids: list[str] | None = None
+        self._accepted_by_req: dict[str, int] = {}
         if self.num_spec_tokens:
+            self._accepted_staging_cpu = torch.ones(
+                self.max_num_reqs, dtype=torch.int32, pin_memory=PIN_MEMORY
+            )
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
@@ -1596,6 +1610,44 @@ class GPUModelRunner(
         else:
             return None
 
+    def _resolve_accepted_tokens_by_request(
+        self, scheduler_output: "SchedulerOutput", num_reqs: int
+    ) -> None:
+        """Fill this step's accepted-token counts by request id (align mode).
+
+        Must run after ``num_accepted_tokens_event.synchronize()``, so the
+        staged copy of the previous step is complete. A request that did not
+        run a step yet, or whose state is rebuilt (preempted or resumed),
+        reads its state from slot 0, i.e. a count of 1.
+        """
+        by_req = self._accepted_by_req
+        staged_ids = self._accepted_staging_req_ids
+        if staged_ids is not None:
+            assert self._accepted_staging_cpu is not None
+            staged = self._accepted_staging_cpu.numpy()
+            for i, req_id in enumerate(staged_ids):
+                by_req[req_id] = int(staged[i])
+            self._accepted_staging_req_ids = None
+
+        for req_id in itertools.chain(
+            scheduler_output.finished_req_ids,
+            scheduler_output.preempted_req_ids or (),
+            scheduler_output.scheduled_cached_reqs.resumed_req_ids,
+        ):
+            by_req.pop(req_id, None)
+        if len(by_req) > len(self.requests):
+            self._accepted_by_req = by_req = {
+                req_id: count
+                for req_id, count in by_req.items()
+                if req_id in self.requests
+            }
+
+        req_ids = self.input_batch.req_ids
+        counts = self.num_accepted_tokens.np
+        for i in range(num_reqs):
+            counts[i] = by_req.get(req_ids[i], 1)
+        self.input_batch.num_accepted_tokens_cpu[:num_reqs] = counts[:num_reqs]
+
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -1621,18 +1673,20 @@ class GPUModelRunner(
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
+            # Stage the counts away from InputBatch's row-indexed mirror and
+            # remember which request each row belongs to (see __init__).
+            assert self._accepted_staging_cpu is not None
             mamba_utils.postprocess_mamba_align_gpu(
                 bufs=self._get_mamba_bufs(),
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
-                num_accepted_tokens_cpu_tensor=(
-                    self.input_batch.num_accepted_tokens_cpu_tensor
-                ),
+                num_accepted_tokens_cpu_tensor=self._accepted_staging_cpu,
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
                 forward_context=self.compilation_config.static_forward_context,
                 mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
             )
+            self._accepted_staging_req_ids = list(self.input_batch.req_ids[:num_reqs])
 
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
@@ -2149,8 +2203,10 @@ class GPUModelRunner(
         if needs_cpu_accepted_counts:
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.synchronize()
+            if self.cache_config.mamba_cache_mode == "align":
+                self._resolve_accepted_tokens_by_request(scheduler_output, num_reqs)
             # Async mode: condense() reordered indices, use prev_positions mapping
-            if self.use_async_scheduling and prev_req_id_to_index:
+            elif self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
                 new_mask = prev_idx < 0
                 self.num_accepted_tokens.np[:num_reqs] = (
