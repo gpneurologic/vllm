@@ -32,6 +32,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import register_model_loader
@@ -305,6 +306,7 @@ class GgufEngramEmbedding(nn.Module):
         self.cpu_offload = False
         self.packed_fp4 = False
         self._table = None
+        self._warned = False
 
     def _rows(self) -> np.ndarray:
         if self._table is None:
@@ -312,7 +314,10 @@ class GgufEngramEmbedding(nn.Module):
             self._table = np.frombuffer(mv, dtype=np.uint8).reshape(-1, self.row_bytes)
         return self._table
 
+    @eager_break_during_capture
     def lookup(self, hash_ids: torch.Tensor, rows: torch.Tensor, background=False):
+        """Writes into `rows` (the caller's persistent staging buffer); runs
+        eagerly between graph segments, since it reads the file on the host."""
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
         if not (is_forward_context_available()
@@ -328,7 +333,18 @@ class GgufEngramEmbedding(nn.Module):
         if c == 0:
             return
         flat = local.reshape(-1).cpu().numpy().astype(np.int64)
-        assert flat.size == 0 or (flat.min() >= 0 and flat.max() < self.n_rows)
+        bad = (flat < 0) | (flat >= self.n_rows)
+        if bad.any():
+            # graph capture runs this once on dummy hashes; real hashes are
+            # always in range
+            if not self._warned:
+                logger.warning("DeepSeek V4.1 GGUF Engram: %d out-of-range hash ids "
+                               "(zero rows used); expected only during graph capture",
+                               int(bad.sum()))
+                self._warned = True
+            flat = np.where(bad, 0, flat)
         raw = torch.from_numpy(self._rows()[flat + self.base]).to(rows.device)
         v = dequant_iq4_nl(raw, self.dim)
+        if bad.any():
+            v[torch.from_numpy(bad).to(v.device)] = 0
         rows[:, :c].copy_(v.view(n, c, self.dim).to(rows.dtype))

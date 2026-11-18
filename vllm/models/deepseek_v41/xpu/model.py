@@ -633,6 +633,11 @@ class DeepseekV41LLMForCausalLM(nn.Module, SupportsPP):
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
+        for m in self.modules():
+            if isinstance(m, DeepseekV41XPUAttention):
+                m.prepare_decode_weights()
+            elif isinstance(m, XpuOffloadMoE) and m._gate_f32 is None:
+                m._gate_f32 = m.gate.weight.float()
 
 
 __all__ = [

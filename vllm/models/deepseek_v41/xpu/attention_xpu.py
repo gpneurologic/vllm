@@ -46,8 +46,9 @@ if TYPE_CHECKING:
 
 
 class DeepseekV41XPUMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
-    # Eager first: no graph support claimed.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # Uniform-batch decode graphs (breakable: the indexer / attention run in
+    # an eager break, see DeepseekV4Attention._sparse_indexer_and_attn).
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
 
 class DeepseekV41XPUBackend(DeepseekV4SparseMLABackend):
@@ -57,7 +58,7 @@ class DeepseekV41XPUBackend(DeepseekV4SparseMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None):
-        return [128]
+        return [int(__import__("os").environ.get("VLLM_DS41_KV_BLOCK", "128"))]
 
     @staticmethod
     def get_builder_cls() -> type[DeepseekV41XPUMetadataBuilder]:
@@ -69,7 +70,7 @@ class DeepseekV41XPUBackend(DeepseekV4SparseMLABackend):
 
 
 class DeepseekV41XPUSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
 
 class DeepseekV41XPUSWABackend(DeepseekSparseSWABackend):
@@ -173,6 +174,21 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
         )
         return q
 
+    def prepare_decode_weights(self) -> None:
+        """float32 copy of wo_a's block scales for the decode GEMV; made after
+        loading so graph capture does not record it."""
+        if self.wo_a.weight.dtype != torch.float8_e4m3fn:
+            return
+        s = getattr(self.wo_a, "weight_scale_inv", None)
+        if s is None:
+            s = self.wo_a.weight_scale
+        sf = s.data
+        if sf.dtype == torch.float8_e8m0fnu:
+            sf = sf.view(torch.uint8).to(torch.int32).sub(127).float().exp2()
+        elif sf.dtype == torch.uint8:
+            sf = sf.to(torch.int32).sub(127).float().exp2()
+        self._wo_a_sf = sf.float().contiguous()
+
     # ---------------------------------------------------------------- output proj
     def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         o = attn_out[:, : self.n_local_heads]
@@ -193,15 +209,7 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
         if T <= _WO_A_GEMV_MAX_TOKENS and self.wo_a.weight.dtype == torch.float8_e4m3fn:
             # Decode: Triton GEMV straight on the FP8 weight and its block scales.
             if self._wo_a_sf is None:
-                s = getattr(self.wo_a, "weight_scale_inv", None)
-                if s is None:
-                    s = self.wo_a.weight_scale
-                sf = s.data
-                if sf.dtype == torch.float8_e8m0fnu:
-                    sf = sf.view(torch.uint8).to(torch.int32).sub(127).float().exp2()
-                elif sf.dtype == torch.uint8:
-                    sf = sf.to(torch.int32).sub(127).float().exp2()
-                self._wo_a_sf = sf.float().contiguous()
+                self.prepare_decode_weights()
             ob = _act_fp8_roundtrip(o).to(torch.bfloat16)
             z = fp8_grouped_gemv(ob, self.wo_a.weight.data, self._wo_a_sf, g)
             return self._wo_b_proj(z.to(torch.bfloat16).flatten(1))
