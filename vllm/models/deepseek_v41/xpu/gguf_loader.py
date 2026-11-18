@@ -239,10 +239,20 @@ def load_expert_slice(ck: GGUFCheckpoint, layer: int, e_start: int, n: int,
     return w13, w2, g.type_id, d.type_id
 
 
+# (token, expert) pairs up to which the decode GEMV path is used
+_DECODE_MAX_PAIRS = int(os.environ.get("VLLM_DS41_DECODE_MAX_PAIRS", "64"))
+
+
 def run_gguf_experts(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
     """Add the local experts' outputs to out (float32 [T, H]) in place."""
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
+    if idx.numel() <= _DECODE_MAX_PAIRS:
+        from .gguf_moe_decode import moe_decode
+
+        kernels()  # registers the plugin package (IQ tables)
+        moe_decode(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit)
+        return
     _, moe, block_m = kernels()
     local = (idx >= e_start) & (idx < e_start + n_local)
     tok, slot = local.nonzero(as_tuple=True)

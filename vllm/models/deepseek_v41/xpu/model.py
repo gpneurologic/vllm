@@ -60,6 +60,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
 from .attention_xpu import DeepseekV41XPUAttention
+from . import prof
 from .gguf_loader import GgufEngramEmbedding, gguf_path, load_expert_slice, run_gguf_experts
 from .offload import DiskEngramEmbedding, ExpertCache, run_expert
 
@@ -167,12 +168,13 @@ class XpuOffloadMoE(nn.Module):
         return self.w13.numel() + self.w2.numel()
 
     def forward(self, x: torch.Tensor, input_ids=None) -> torch.Tensor:
-        scores = F.linear(x.float(), self.gate.weight.float())
-        scores = F.softplus(scores).sqrt()
-        idx = (scores + self.gate.e_score_correction_bias).topk(self.topk, dim=-1)[1]
-        w = scores.gather(1, idx)
-        w = w / (w.sum(-1, keepdim=True) + 1e-20) * self.route_scale
-        out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
+        with prof.section("router"):
+            scores = F.linear(x.float(), self.gate.weight.float())
+            scores = F.softplus(scores).sqrt()
+            idx = (scores + self.gate.e_score_correction_bias).topk(self.topk, dim=-1)[1]
+            w = scores.gather(1, idx)
+            w = w / (w.sum(-1, keepdim=True) + 1e-20) * self.route_scale
+            out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         # The memory-profile / warm-up passes run without attention metadata:
         # skip routed experts there so the expert cache (allocated outside
         # vLLM's memory budget) is not counted as model memory.
@@ -181,8 +183,9 @@ class XpuOffloadMoE(nn.Module):
         )
         if self.gguf:
             if x.shape[0] > 0 and self.w13 is not None:
-                run_gguf_experts(x, idx, w, out, self.w13, self.w2, self.t13, self.t2,
-                                 self.e_start, self.n_local, self.swiglu_limit)
+                with prof.section("routed_moe"):
+                    run_gguf_experts(x, idx, w, out, self.w13, self.w2, self.t13, self.t2,
+                                     self.e_start, self.n_local, self.swiglu_limit)
         elif x.shape[0] > 0 and real_step:
             local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
             experts = torch.unique(idx[local]).tolist()
@@ -196,9 +199,11 @@ class XpuOffloadMoE(nn.Module):
                         0, rows,
                         run_expert(x[rows], parts, self.swiglu_limit, w[rows, slot, None]),
                     )
-        out = out + self.shared_experts(x).float()
+        with prof.section("shared_expert"):
+            out = out + self.shared_experts(x).float()
         if self.tp_size > 1:
-            out = tensor_model_parallel_all_reduce(out)
+            with prof.section("allreduce"):
+                out = tensor_model_parallel_all_reduce(out)
         return out.to(x.dtype)
 
 
@@ -249,6 +254,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre_delayed = MHCPreDelayedOp()
         self.mhc_post = MHCPostOp()
 
+    @staticmethod
+    def _mhc(op, *args, **kwargs):
+        with prof.section("mhc"):
+            return op(*args, **kwargs)
+
     def _pre_args(self, fn, scale, base):
         return (fn, scale, base, self.rms_norm_eps, self.hc_eps, self.hc_eps,
                 self.hc_post_alpha, self.hc_sinkhorn_iters)
@@ -261,7 +271,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if x.dim() == 2:
                 assert self.hc_attn_fn_broadcast is not None
                 residual = x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
-                residual, post_mix, res_mix, x, attn_pre = mhc_pre(
+                residual, post_mix, res_mix, x, attn_pre = self._mhc(mhc_pre,
                     residual,
                     self.hc_attn_fn_broadcast,
                     *attn_args[1:],
@@ -269,36 +279,41 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
             else:
                 residual = x
-                residual, post_mix, res_mix, x, attn_pre = mhc_pre(
+                residual, post_mix, res_mix, x, attn_pre = self._mhc(mhc_pre,
                     residual, *attn_args, pre_mix=pre_mix,
                     norm_weight=None, norm_eps=self.attn_norm.variance_epsilon,
                     fn_packed=None,
                 )
         elif self.engram is not None and engram_hashes is not None:
-            residual = self.mhc_post(x, residual, post_mix, res_mix)
-            residual = self.engram(
-                residual, engram_hashes[:, self.engram.layer_hash_index], engram_mask
-            )
-            residual, post_mix, res_mix, x, attn_pre = mhc_pre(
+            with prof.section("mhc"):
+                residual = self.mhc_post(x, residual, post_mix, res_mix)
+            with prof.section("engram"):
+                residual = self.engram(
+                    residual, engram_hashes[:, self.engram.layer_hash_index], engram_mask
+                )
+            residual, post_mix, res_mix, x, attn_pre = self._mhc(mhc_pre,
                 residual, *attn_args, pre_mix=pre_mix,
                 norm_weight=None, norm_eps=self.attn_norm.variance_epsilon,
                 fn_packed=None,
             )
         else:
-            residual, post_mix, res_mix, x, attn_pre = mhc_pre(
+            residual, post_mix, res_mix, x, attn_pre = self._mhc(mhc_pre,
                 residual, *attn_args, pre_mix=pre_mix, sublayer_out=x,
                 post_layer_mix=post_mix, comb_res_mix=res_mix,
                 norm_weight=None, norm_eps=self.attn_norm.variance_epsilon,
                 fn_packed=None,
             )
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        with prof.section("attention"):
+            x = self.attn_norm(x)
+            x = self.attn(positions, x, None)
         if _DEBUG:
             torch.accelerator.synchronize()
             logger.info("DS41DBG   after attn, host avail %d MiB", _avail_mib())
-        x = tensor_model_parallel_all_reduce(x) if self.attn.wo_b.reduce_results is False else x
+        if self.attn.wo_b.reduce_results is False:
+            with prof.section("allreduce"):
+                x = tensor_model_parallel_all_reduce(x)
         ffn_args = self._pre_args(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        residual, post_mix, res_mix, x, ffn_pre = mhc_pre(
+        residual, post_mix, res_mix, x, ffn_pre = self._mhc(mhc_pre,
             residual, *ffn_args, pre_mix=attn_pre, sublayer_out=x,
             post_layer_mix=post_mix, comb_res_mix=res_mix,
             norm_weight=None, norm_eps=self.ffn_norm.variance_epsilon, fn_packed=None,
@@ -378,6 +393,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         self.end_layer - 1, type(md).__name__,
                         None if input_ids is None else tuple(input_ids.shape),
                         None if lookback_token_ids is None else tuple(lookback_token_ids.shape))
+        prof.begin_step(positions.shape[0])
         if get_pp_group().is_first_rank:
             hidden_states = (
                 inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
@@ -386,6 +402,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
 
         engram_hashes = engram_mask = None
+        _ps = prof.section("engram_hash")
+        _ps.__enter__()
         if self.engram_hash is not None and input_ids is not None and is_forward_context_available():
             attn_metadata = get_forward_context().attn_metadata
             if isinstance(attn_metadata, dict) and self.engram_hash.ensure_cache():
@@ -408,6 +426,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             gathered[:, layer.engram.layer_hash_index]
                         )
 
+        _ps.__exit__(None, None, None)
         if _DEBUG:
             logger.info("DS41DBG engram step done (hashes=%s)", engram_hashes is not None)
         residual = post_mix = res_mix = None
@@ -427,14 +446,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual, engram_hashes, engram_mask,
             )
         if ran:
-            hidden_states = self.mhc_post(hidden_states, residual, post_mix, res_mix)
+            with prof.section("mhc"):
+                hidden_states = self.mhc_post(hidden_states, residual, post_mix, res_mix)
         if dbg:
             torch.accelerator.synchronize()
             logger.info("DS41DBG layers done")
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "pre_mix": pre_mix})
         hidden_states = torch.ops.vllm.hc_collapse_triton(hidden_states, pre_mix)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        prof.end_step()
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked = [
