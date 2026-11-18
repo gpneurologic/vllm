@@ -54,7 +54,7 @@ TAG = "TP padding"
 PLAN_ATTR = "vllm_tp_pad_plan"
 ALIGN = 128  # MLP / per-GPU alignment: FP8 blocks, GPTQ groups (<=128) and packing
 # Text configs this padding knows the weight layout of (dense Qwen3.5/3.8).
-MODEL_TYPES = ("qwen3_5_text", "gemma4_text", "qwen4_exp_text")
+MODEL_TYPES = ("qwen3_5_text", "gemma4_text", "qwen4_exp_text", "deepseek_v41_text")
 
 _TEXT_KEYS = (
     "num_attention_heads",
@@ -186,10 +186,16 @@ def maybe_pad_config(hf_config: Any, hf_text_config: Any, tp: int | None = None)
     tp = tp or _tp_size
     if not tp or tp == 1 or getattr(hf_text_config, PLAN_ATTR, None) is not None:
         return
+    if getattr(hf_config, "model_type", None) == "deepseek_v41" and hasattr(
+        hf_text_config, "o_groups"
+    ):  # its text sub-config may load with an empty model_type
+        return _pad_config_dsv41(hf_config, hf_text_config, tp)
     if getattr(hf_text_config, "model_type", None) not in MODEL_TYPES:
         return
     if hf_text_config.model_type == "gemma4_text":
         return _pad_config_gemma4(hf_config, hf_text_config, tp)
+    if hf_text_config.model_type == "deepseek_v41_text":
+        return _pad_config_dsv41(hf_config, hf_text_config, tp)
     # Qwen4Exp (Flash Next) is a MoE: same attention layouts as Qwen3.5, but
     # no dense MLP. Its routed experts are not padded (their INT4 groups of 128
     # along a width of 640 can't be dealt to 3 GPUs without 20% zero padding);
@@ -528,6 +534,9 @@ def pad_weights(
     weights: Iterable[tuple[str, torch.Tensor]], plan: dict
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Pad checkpoint tensors on the fly according to ``plan``."""
+    if plan.get("arch") == "dsv41":
+        yield from _pad_weights_dsv41(weights, plan)
+        return
     rules = [(re.compile(pat), kind, segs) for pat, kind, segs in _rules(plan)]
     ba = re.compile(r"\.linear_attn\.in_proj_[ab]$")
     pending: dict[str, dict] = {}  # 4-bit in_proj_a/b parts waiting for the rest
@@ -570,3 +579,87 @@ def pad_weights(
     logger.info("%s: padded %d tensors while loading", TAG, padded)
     if dequantized:
         logger.info("%s: dequantized %d in_proj_a/b layers", TAG, dequantized)
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek V4.1 (deepseek_v41_text): attention padding for TP sizes that do not
+# divide its 64 query heads / 8 output groups / 32 indexer heads (TP=3).
+#
+#   query heads   H -> H'  in whole output groups (H/G heads each), G -> G'
+#   indexer heads IH -> IH' (a multiple of 16 per GPU)
+#
+# Dummy heads get zero wq_b rows, so their queries are zero. A zero query still
+# attends (uniformly), but its group's wo_a rows and the matching wo_b input
+# columns are zero, so it adds nothing. Dummy indexer heads have zero wq_b
+# rows and zero weights_proj rows, so their scores are zero. The indexer's
+# 1/sqrt(n_heads) factor changes uniformly, which leaves its top-k unchanged.
+# Routed experts are split by expert parallelism; the shared expert (2304 =
+# 3 x 768) and the Engram hash columns (24) already divide.
+
+
+def _pad_config_dsv41(hf_config: Any, t: Any, tp: int) -> None:
+    H, G, IH = int(t.num_attention_heads), int(t.o_groups), int(t.index_n_heads)
+    if H % G:
+        return
+    G2 = _round_up(G, tp)
+    H2 = G2 * (H // G)
+    IH2 = IH if IH % (tp * 16) == 0 else _round_up(IH, tp * 16)
+    if (H2, G2, IH2) == (H, G, IH):
+        return
+    plan = dict(
+        arch="dsv41", tp=tp, H=H, H2=H2, G=G, G2=G2, IH=IH, IH2=IH2,
+        D=int(t.head_dim), R=int(t.o_lora_rank), ID=int(t.index_head_dim),
+    )
+    t.num_attention_heads = H2
+    t.o_groups = G2
+    t.index_n_heads = IH2
+    setattr(t, PLAN_ATTR, plan)
+    logger.info(
+        "%s: TP=%d doesn't divide DeepSeek V4.1 attention, padding while loading: "
+        "query heads %d->%d, output groups %d->%d, indexer heads %d->%d",
+        TAG, tp, H, H2, G, G2, IH, IH2,
+    )
+
+
+def _pad_rows(t: torch.Tensor, dim: int, new: int) -> torch.Tensor:
+    old = t.shape[dim]
+    if old == new:
+        return t
+    assert new > old, (old, new)
+    dtype = t.dtype
+    u = t.view(torch.uint8) if t.element_size() == 1 else t
+    shape = list(u.shape)
+    shape[dim] = new - old
+    out = torch.cat([u, u.new_zeros(shape)], dim=dim)
+    return out.view(dtype) if t.element_size() == 1 else out
+
+
+def _pad_weights_dsv41(
+    weights: Iterable[tuple[str, torch.Tensor]], p: dict
+) -> Iterator[tuple[str, torch.Tensor]]:
+    D, R, ID, B = p["D"], p["R"], p["ID"], 32
+    rules = [
+        # (pattern, dim, new size for weight, new size for its block scale)
+        (r"\.attn\.wq_b\.", 0, p["H2"] * D),
+        (r"\.attn\.wo_a\.", 0, p["G2"] * R),
+        (r"\.attn\.wo_b\.", 1, p["G2"] * R),
+        (r"\.attn\.indexer\.wq_b\.", 0, p["IH2"] * ID),
+        (r"\.attn\.indexer\.weights_proj\.", 0, p["IH2"]),
+    ]
+    rules = [(re.compile(pat), dim, n) for pat, dim, n in rules]
+    sink = re.compile(r"\.attn\.attn_sink$")
+    padded = 0
+    for name, t in weights:
+        if sink.search(name):
+            padded += 1
+            yield name, _pad_rows(t, 0, p["H2"])
+            continue
+        for pat, dim, n in rules:
+            if pat.search(name) and name.endswith((".weight", ".scale")):
+                if name.endswith(".scale"):
+                    n = n // B
+                t = _pad_rows(t, dim, n)
+                padded += 1
+                break
+        yield name, t
+    logger.info("%s: padded %d DeepSeek V4.1 tensors while loading", TAG, padded)

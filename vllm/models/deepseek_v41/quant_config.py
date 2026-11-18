@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, cast
 import regex as re
 
 from vllm.config import get_current_vllm_config
+from vllm.platforms import current_platform
 from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
@@ -223,6 +224,7 @@ class DeepseekV4FP8Config(Fp8Config):
             isinstance(layer, LinearBase)
             and self.weight_block_size == [32, 32]
             and self.is_scale_e8m0
+            and not current_platform.is_xpu()
         ):
             if is_layer_skipped(
                 prefix=prefix,
