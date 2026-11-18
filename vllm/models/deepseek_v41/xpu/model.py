@@ -61,12 +61,14 @@ from vllm.utils.math_utils import cdiv
 
 from .attention_xpu import DeepseekV41XPUAttention
 from . import prof
+from .mhc_xpu import XpuMHCPreDelayed
 from .gguf_loader import GgufEngramEmbedding, gguf_path, load_expert_slice, run_gguf_experts
 from .offload import DiskEngramEmbedding, ExpertCache, run_expert
 
 logger = init_logger(__name__)
 _DEBUG = __import__("os").environ.get("VLLM_DS41_DEBUG") == "1"
 _TORCH_ROUTER = __import__("os").environ.get("VLLM_DS41_TORCH_ROUTER") == "1"
+_MHC_TRITON = __import__("os").environ.get("VLLM_DS41_MHC_TRITON", "1") == "1"
 
 
 def _avail_mib() -> int:
@@ -272,7 +274,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_attn_scale = p(3)
         self.hc_ffn_scale = p(3)
         self.hc_attn_fn_broadcast: torch.Tensor | None = None
-        self.mhc_pre_delayed = MHCPreDelayedOp()
+        self.mhc_pre_delayed = XpuMHCPreDelayed() if _MHC_TRITON else MHCPreDelayedOp()
         self.mhc_post = MHCPostOp()
 
     @staticmethod
