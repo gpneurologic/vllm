@@ -362,6 +362,10 @@ def _xpu_init(self, *, vllm_config, prefix: str = ""):
 
 
 def _xpu_load_weights(self, weights):
+    from .gguf_loader import gguf_path
+
+    if gguf_path():  # GGUF: every weight comes from the GGUF loader
+        return _xpu_orig_load(self, weights)
     extra = engram_shard_small_weights(self._ckpt_folder)
     return _xpu_orig_load(self, _itertools.chain(weights, extra))
 

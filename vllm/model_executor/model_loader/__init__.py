@@ -128,6 +128,9 @@ def register_model_loader(load_format: str):
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
+    if load_format == "ds41_gguf" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+        # DeepSeek V4.1 GGUF on XPU; importing the module registers the loader.
+        import vllm.models.deepseek_v41.xpu.gguf_loader  # noqa: F401
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)

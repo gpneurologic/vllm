@@ -60,6 +60,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
 from .attention_xpu import DeepseekV41XPUAttention
+from .gguf_loader import GgufEngramEmbedding, gguf_path, load_expert_slice, run_gguf_experts
 from .offload import DiskEngramEmbedding, ExpertCache, run_expert
 
 logger = init_logger(__name__)
@@ -81,6 +82,7 @@ class XpuDiskEngram(Engram):
     def __init__(self, config, quant_config, layout, layer_hash_index, prefix, folder):
         object.__setattr__(self, "_ckpt_folder", folder)
         object.__setattr__(self, "_layer_id", extract_layer_index(prefix))
+        object.__setattr__(self, "_hf_config", config)
         super().__init__(
             config, quant_config, layout, layer_hash_index,
             use_sequence_parallel=False, prefix=prefix,
@@ -102,6 +104,10 @@ class XpuDiskEngram(Engram):
 
     def _create_embedding(self, layout: EngramLayout, layer_hash_index: int):
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+        if gguf_path():
+            return GgufEngramEmbedding(
+                self._hf_config, self._layer_id, n_hash_cols, layout.head_dim
+            )
         return DiskEngramEmbedding(
             self._ckpt_folder, self._layer_id, n_hash_cols, layout.head_dim
         )
@@ -147,6 +153,18 @@ class XpuOffloadMoE(nn.Module):
             reduce_results=False,
             prefix=f"{prefix}.shared_experts",
         )
+        # GGUF builds: the local experts stay on the device in GGUF form.
+        self.gguf = gguf_path() is not None
+        self.w13 = self.w2 = None
+        self.t13 = self.t2 = 0
+
+    def load_gguf_experts(self, ck) -> int:
+        layer = int(self.prefix_ckpt.split(".")[1])
+        dev = self.gate.weight.device
+        self.w13, self.w2, self.t13, self.t2 = load_expert_slice(
+            ck, layer, self.e_start, self.n_local, dev
+        )
+        return self.w13.numel() + self.w2.numel()
 
     def forward(self, x: torch.Tensor, input_ids=None) -> torch.Tensor:
         scores = F.linear(x.float(), self.gate.weight.float())
@@ -161,7 +179,11 @@ class XpuOffloadMoE(nn.Module):
         real_step = is_forward_context_available() and isinstance(
             get_forward_context().attn_metadata, dict
         )
-        if x.shape[0] > 0 and real_step:
+        if self.gguf:
+            if x.shape[0] > 0 and self.w13 is not None:
+                run_gguf_experts(x, idx, w, out, self.w13, self.w2, self.t13, self.t2,
+                                 self.e_start, self.n_local, self.swiglu_limit)
+        elif x.shape[0] > 0 and real_step:
             local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
             experts = torch.unique(idx[local]).tolist()
             if experts:
