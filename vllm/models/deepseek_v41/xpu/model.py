@@ -66,6 +66,7 @@ from .offload import DiskEngramEmbedding, ExpertCache, run_expert
 
 logger = init_logger(__name__)
 _DEBUG = __import__("os").environ.get("VLLM_DS41_DEBUG") == "1"
+_TORCH_ROUTER = __import__("os").environ.get("VLLM_DS41_TORCH_ROUTER") == "1"
 
 
 def _avail_mib() -> int:
@@ -157,7 +158,31 @@ class XpuOffloadMoE(nn.Module):
         # GGUF builds: the local experts stay on the device in GGUF form.
         self.gguf = gguf_path() is not None
         self.w13 = self.w2 = None
+        self._gate_f32: torch.Tensor | None = None
         self.t13 = self.t2 = 0
+
+    def _route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """sqrt(softplus) scores, top-k on scores + bias, renormalized x scale."""
+        if self._gate_f32 is None:
+            self._gate_f32 = self.gate.weight.float()
+        logits = F.linear(x.float(), self._gate_f32)
+        if _TORCH_ROUTER:
+            scores = F.softplus(logits).sqrt()
+            idx = (scores + self.gate.e_score_correction_bias).topk(self.topk, dim=-1)[1]
+            w = scores.gather(1, idx)
+            return w / (w.sum(-1, keepdim=True) + 1e-20) * self.route_scale, idx
+        from vllm import _custom_ops as ops
+
+        T = x.shape[0]
+        w = torch.empty(T, self.topk, dtype=torch.float32, device=x.device)
+        idx = torch.empty(T, self.topk, dtype=torch.int32, device=x.device)
+        tei = torch.empty(T, self.topk, dtype=torch.int32, device=x.device)
+        ops.topk_hash_softplus_sqrt(
+            w, idx, tei, logits, renormalize=True,
+            routed_scaling_factor=self.route_scale,
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+        )
+        return w, idx
 
     def load_gguf_experts(self, ck) -> int:
         layer = int(self.prefix_ckpt.split(".")[1])
@@ -169,11 +194,7 @@ class XpuOffloadMoE(nn.Module):
 
     def forward(self, x: torch.Tensor, input_ids=None) -> torch.Tensor:
         with prof.section("router"):
-            scores = F.linear(x.float(), self.gate.weight.float())
-            scores = F.softplus(scores).sqrt()
-            idx = (scores + self.gate.e_score_correction_bias).topk(self.topk, dim=-1)[1]
-            w = scores.gather(1, idx)
-            w = w / (w.sum(-1, keepdim=True) + 1e-20) * self.route_scale
+            w, idx = self._route(x)
             out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         # The memory-profile / warm-up passes run without attention metadata:
         # skip routed experts there so the expert cache (allocated outside

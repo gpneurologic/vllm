@@ -7,7 +7,8 @@ Built on the shared V4.1 `DeepseekV4Attention`. Differences from CUDA:
   what V4.1 uses on every non-SM100 GPU, so the V4 XPU decode kernel reads them.
 - Q gets GPT-J RoPE only (V4.1 norms qr before wq_b; there is no per-head Q norm,
   unlike V4, so the V4 XPU `qnorm_rope` kernel cannot be reused for Q).
-- The output projection dequantizes wo_a once to bf16 and runs a grouped einsum.
+- The output projection runs wo_a with a Triton FP8 GEMV in decode (fp8_gemv.py),
+  and dequantizes it per call for larger batches.
 """
 
 from typing import TYPE_CHECKING, ClassVar, cast
@@ -37,6 +38,8 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.worker.workspace import current_workspace_manager
+
+from .fp8_gemv import fp8_grouped_gemv
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -105,6 +108,22 @@ def _act_fp8_roundtrip(x: torch.Tensor, block: int = 32) -> torch.Tensor:
     return (q * s).flatten(-2)
 
 
+def _act_fp8_quant(x: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    """x [..., K] -> (fp8 e4m3 [..., K], float32 power-of-two scales [..., K/block]);
+    the same values as `_act_fp8_roundtrip`, kept quantized."""
+    xf = x.float().unflatten(-1, (-1, block))
+    amax = xf.abs().amax(-1, keepdim=True).clamp_min(1e-4)
+    m, e = torch.frexp(amax / 448.0)
+    e = e - (m == 0.5).to(e.dtype)
+    s = torch.ldexp(torch.ones_like(amax), e)
+    q = (xf / s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return q.flatten(-2), s.squeeze(-1)
+
+
+_WO_A_BMM = __import__("os").environ.get("VLLM_DS41_WO_A_BMM") == "1"
+_WO_A_GEMV_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_WO_A_GEMV_MAX_TOKENS", "16"))
+
+
 def _dequant_block_fp8(w: torch.Tensor, s: torch.Tensor, block: int = 32) -> torch.Tensor:
     n, k = w.shape
     sf = s.float() if s.dtype != torch.uint8 else torch.ldexp(
@@ -128,6 +147,7 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
         finally:
             torch.cuda.Event = orig  # type: ignore[misc]
         self._wo_a_bf16: torch.Tensor | None = None
+        self._wo_a_sf: torch.Tensor | None = None
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -159,9 +179,34 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
         _gptj_rope(o, positions, self.rotary_emb.cos_sin_cache, inverse=True)
         g = self.n_local_groups
         o = o.reshape(o.shape[0], g, -1)
+        T = o.shape[0]
+        if _WO_A_BMM and getattr(self.wo_a, "bmm_weight", None) is not None:
+            # oneDNN FP8 grouped GEMM (opt-in: slower end to end in decode).
+            q, qs = _act_fp8_quant(o)
+            z = torch.ops.vllm.xpu_fp8_bmm(
+                # the kernel needs a contiguous activation (a strided view gives
+                # wrong results for more than one token)
+                q.transpose(0, 1).contiguous(), self.wo_a.bmm_weight, torch.bfloat16,
+                qs.transpose(0, 1).contiguous(), self.wo_a.bmm_scale, None,
+            )  # [G, T, R]
+            return self._wo_b_proj(z.transpose(0, 1).flatten(1))
+        if T <= _WO_A_GEMV_MAX_TOKENS and self.wo_a.weight.dtype == torch.float8_e4m3fn:
+            # Decode: Triton GEMV straight on the FP8 weight and its block scales.
+            if self._wo_a_sf is None:
+                s = getattr(self.wo_a, "weight_scale_inv", None)
+                if s is None:
+                    s = self.wo_a.weight_scale
+                sf = s.data
+                if sf.dtype == torch.float8_e8m0fnu:
+                    sf = sf.view(torch.uint8).to(torch.int32).sub(127).float().exp2()
+                elif sf.dtype == torch.uint8:
+                    sf = sf.to(torch.int32).sub(127).float().exp2()
+                self._wo_a_sf = sf.float().contiguous()
+            ob = _act_fp8_roundtrip(o).to(torch.bfloat16)
+            z = fp8_grouped_gemv(ob, self.wo_a.weight.data, self._wo_a_sf, g)
+            return self._wo_b_proj(z.to(torch.bfloat16).flatten(1))
         o = _act_fp8_roundtrip(o).to(torch.bfloat16)
-        # Dequantize wo_a per call instead of keeping a bf16 copy (~1 GiB per
-        # GPU over 40 layers, better spent on cached experts).
+        # Fallback: dequantize wo_a per call (no bf16 copy kept).
         w = self.wo_a.weight
         s = getattr(self.wo_a, "weight_scale_inv", None)
         if s is None:
