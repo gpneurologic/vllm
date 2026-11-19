@@ -169,12 +169,39 @@ def translate(name: str) -> tuple[str | None, str]:
     return _GLOBAL[name]
 
 
+# Optional: take the dense linears (FP8, 32x32 block scales) and the bf16
+# embedding / output head from the original checkpoint instead of the GGUF's
+# Q5_K / Q8_0 copies (VLLM_DS41_ORIG_CKPT=<original model folder>).
+_ORIG_KINDS = ("fp8",)
+_ORIG_NAMES = ("embed.weight", "head.weight")
+
+
+def _orig_checkpoint():
+    folder = os.environ.get("VLLM_DS41_ORIG_CKPT")
+    if not folder:
+        return None
+    from .offload import CheckpointFiles
+
+    return CheckpointFiles.get(folder)
+
+
 def gguf_weights(ck: GGUFCheckpoint, dev: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """Original-checkpoint-named tensors made from the GGUF."""
     t0, n, nbytes = time.time(), 0, 0
+    oc = _orig_checkpoint()
+    n_orig = 0
     for gname, t in ck.tensors.items():
         orig, kind = translate(gname)
         if orig is None:
+            continue
+        if oc is not None and kind in _ORIG_KINDS and f"{orig}.weight" in oc.index:
+            yield f"{orig}.weight", oc.tensor(f"{orig}.weight")
+            yield f"{orig}.scale", oc.tensor(f"{orig}.scale").view(torch.float8_e8m0fnu)
+            n_orig += 1
+            continue
+        if oc is not None and orig in _ORIG_NAMES and orig in oc.index:
+            yield orig, oc.tensor(orig)
+            n_orig += 1
             continue
         w = dequant(ck, gname, dev)
         nbytes += t.nbytes
@@ -190,8 +217,9 @@ def gguf_weights(ck: GGUFCheckpoint, dev: torch.device) -> Iterator[tuple[str, t
             yield orig.replace("q_weight", "k_weight"), torch.ones_like(w, dtype=torch.bfloat16)
         n += 1
         del w
-    logger.info("DeepSeek V4.1 GGUF: %d dense tensors (%.2f GB quantized) converted in %.1f s",
-                n, nbytes / 1e9, time.time() - t0)
+    logger.info("DeepSeek V4.1 GGUF: %d dense tensors (%.2f GB quantized) converted, %d taken "
+                "from the original checkpoint, in %.1f s", n, nbytes / 1e9, n_orig,
+                time.time() - t0)
 
 
 @register_model_loader("ds41_gguf")
