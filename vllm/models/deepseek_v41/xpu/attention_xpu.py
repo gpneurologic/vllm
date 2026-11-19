@@ -41,6 +41,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 from . import prof
 from .fp8_gemv import fp8_grouped_gemv
+from .kv_int4_sim import install as _install_kv_int4_sim, int4_roundtrip_
 from .rope_xpu import gptj_rope_, inv_rope_fp8_round
 from .sparse_decode_xpu import sparse_decode_fused
 
@@ -126,6 +127,7 @@ def _act_fp8_quant(x: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torc
 
 _WO_A_BMM = __import__("os").environ.get("VLLM_DS41_WO_A_BMM") == "1"
 _TRITON_ROPE = __import__("os").environ.get("VLLM_DS41_TRITON_ROPE", "1") == "1"
+_install_kv_int4_sim()
 _FUSED_DECODE_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_FUSED_DECODE_MAX_TOKENS", "16"))
 _WO_A_GEMV_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_WO_A_GEMV_MAX_TOKENS", "16"))
 
@@ -185,6 +187,7 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
         )
         kv_roped = kv.clone()
         rope(kv_roped, positions, cos_sin)
+        int4_roundtrip_(kv_roped)  # no-op unless VLLM_DS41_KV_INT4_SIM
         cache = self.swa_cache_layer.kv_cache
         quantize_and_insert_k_cache(
             kv_roped,
