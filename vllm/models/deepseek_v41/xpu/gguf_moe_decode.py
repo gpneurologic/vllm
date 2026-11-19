@@ -266,10 +266,102 @@ def gguf_gemv(x: torch.Tensor, w: torch.Tensor, eid: torch.Tensor, qtype: int,
     return y.sum(0) if split > 1 else y[0]
 
 
+# ---------------------------------------------------------- fused decode glue
+@triton.jit
+def _gemv_kernel_v3(x_ptr, w_ptr, idx_ptr, y_ptr, grid64_ptr, sign_ptr,
+                    N, K, row_bytes, expert_stride, n_pairs, e_start, n_local,
+                    XDIV: tl.constexpr, QTYPE: tl.constexpr, BB: tl.constexpr,
+                    BLOCK_N: tl.constexpr, KB_PER: tl.constexpr):
+    """v2 plus: maps the router's global expert id to this rank's slot (pairs
+    of other ranks write zeros), and reads activation row pid_p // XDIV."""
+    pid_p = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    e = tl.load(idx_ptr + pid_p).to(tl.int32) - e_start
+    rows = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < N
+    rows = tl.where(rmask, rows, 0)
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    if (e >= 0) & (e < n_local):
+        n_kb = K // 256
+        row_base = w_ptr + e.to(tl.int64) * expert_stride + rows.to(tl.int64) * row_bytes
+        xo = tl.arange(0, 32)[:, None] * 8 + tl.arange(0, 8)[None, :]
+        xrow = (pid_p // XDIV) * K
+        for i in range(KB_PER):
+            kb = pid_k * KB_PER + i
+            if kb < n_kb:
+                bp = (row_base + kb * BB)[:, None]
+                wv = _deq_groups(bp, grid64_ptr, sign_ptr, QTYPE)
+                xv = tl.load(x_ptr + xrow + kb * 256 + xo).to(tl.float32)
+                acc += tl.sum(tl.sum(wv * xv[None, :, :], axis=2), axis=1)
+    tl.store(y_ptr + (pid_k * n_pairs + pid_p) * N + rows, acc, mask=rmask)
+
+
+@triton.jit
+def _swiglu_kernel(h_ptr, a_ptr, I, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr):
+    p = tl.program_id(0)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = c < I
+    g = tl.load(h_ptr + p * 2 * I + c, mask=m, other=0.0)
+    u = tl.load(h_ptr + p * 2 * I + I + c, mask=m, other=0.0)
+    if HAS_LIMIT:
+        g = tl.minimum(g, limit)
+        u = tl.minimum(tl.maximum(u, -limit), limit)
+    tl.store(a_ptr + p * I + c, g / (1.0 + tl.exp(-g)) * u, mask=m)
+
+
+@triton.jit
+def _combine_kernel(y_ptr, w_ptr, out_ptr, H, K_TOP: tl.constexpr, KP: tl.constexpr,
+                    BLOCK: tl.constexpr):
+    """out[t] += sum_j w[t, j] * y[t*K_TOP + j]."""
+    t = tl.program_id(0)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = c < H
+    j = tl.arange(0, KP)
+    jm = j < K_TOP
+    wv = tl.load(w_ptr + t * K_TOP + j, mask=jm, other=0.0).to(tl.float32)
+    yv = tl.load(y_ptr + (t * K_TOP + j)[:, None] * H + c[None, :], mask=jm[:, None] & m[None, :],
+                 other=0.0)
+    o = tl.load(out_ptr + t * H + c, mask=m)
+    tl.store(out_ptr + t * H + c, o + tl.sum(yv * wv[:, None], axis=0), mask=m)
+
+
+def _gemv3(x, w, idx_flat, qtype, e_start, n_local, xdiv):
+    P = idx_flat.shape[0]
+    K = x.shape[1]
+    E, N, rb = w.shape
+    bn, kp, nw = _V2_CFG.get((qtype, K), (4, 4, 2))
+    split = triton.cdiv(K // 256, kp)
+    y = torch.empty(split, P, N, dtype=torch.float32, device=x.device)
+    _, grid64, sign_t = _iq_tables(x.device, qtype)
+    _gemv_kernel_v3[(P, triton.cdiv(N, bn), split)](
+        x, w, idx_flat, y, grid64, sign_t, N, K, rb, w.stride(0), P, e_start, n_local,
+        XDIV=xdiv, QTYPE=qtype, BB=_BLOCK_BYTES[qtype], BLOCK_N=bn, KB_PER=kp, num_warps=nw,
+    )
+    return y.sum(0) if split > 1 else y[0]
+
+
+_FUSED_GLUE = __import__("os").environ.get("VLLM_DS41_MOE_FUSED_GLUE", "1") == "1"
+
+
 def moe_decode(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
     """Add the local experts' outputs for all (token, slot) pairs to out
     (float32 [T, H]); no host sync."""
     T, k = idx.shape
+    if _FUSED_GLUE and _KERNEL_V == 2:
+        idx_flat = idx.reshape(-1)
+        x = x.contiguous()
+        h = _gemv3(x, w13, idx_flat, t13, e_start, n_local, k)  # [P, 2I]
+        P, I2 = h.shape
+        I = I2 // 2
+        a = torch.empty(P, I, dtype=torch.float32, device=x.device)
+        _swiglu_kernel[(P, triton.cdiv(I, 1024))](h, a, I, float(limit or 0.0),
+                                                  HAS_LIMIT=bool(limit), BLOCK=1024)
+        y = _gemv3(a, w2, idx_flat, t2, e_start, n_local, 1)  # [P, H]
+        H = y.shape[1]
+        _combine_kernel[(T, triton.cdiv(H, 1024))](y, w.contiguous(), out, H, K_TOP=k,
+                                                   KP=triton.next_power_of_2(k), BLOCK=1024)
+        return
     local = (idx >= e_start) & (idx < e_start + n_local)
     eid = torch.where(local, idx - e_start, -1).to(torch.int32).reshape(-1)
     xs = x.repeat_interleave(k, dim=0)  # [T*k, H]
