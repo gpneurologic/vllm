@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.worker.workspace import current_workspace_manager
 
+from . import prof
 from .fp8_gemv import fp8_grouped_gemv
 
 if TYPE_CHECKING:
@@ -149,6 +150,20 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
             torch.cuda.Event = orig  # type: ignore[misc]
         self._wo_a_bf16: torch.Tensor | None = None
         self._wo_a_sf: torch.Tensor | None = None
+        if prof.ENABLED:
+            for meth, name in (("_run_parallel_input_projections", "in_proj"),
+                               ("_split_qkv_and_norm", "split_norm"),
+                               ("_prepare_and_attn", "prepare_and_attn"),
+                               ("_fused_qnorm_rope_kv_insert", "rope_kv_insert"),
+                               ("_sparse_indexer_and_attn", "indexer_and_attn"),
+                               ("forward_mqa", "mqa"),
+                               ("_o_proj", "o_proj")):
+                if hasattr(self, meth):
+                    prof.wrap_method(self, meth, name)
+            for sub, name in (("compressor", "compressor"), ("indexer", "indexer")):
+                m = getattr(self, sub, None)
+                if m is not None:
+                    prof.wrap_method(m, "forward", name)
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
