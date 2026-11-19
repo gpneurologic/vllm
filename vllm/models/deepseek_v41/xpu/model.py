@@ -69,6 +69,19 @@ logger = init_logger(__name__)
 _DEBUG = __import__("os").environ.get("VLLM_DS41_DEBUG") == "1"
 _TORCH_ROUTER = __import__("os").environ.get("VLLM_DS41_TORCH_ROUTER") == "1"
 _MHC_TRITON = __import__("os").environ.get("VLLM_DS41_MHC_TRITON", "1") == "1"
+# wo_a in INT4 cost ~2.5% perplexity in tests, so it stays FP8 unless asked.
+_INT4_WO_A = __import__("os").environ.get("VLLM_DS41_INT4_WO_A", "0") == "1"
+# embedding / LM head: fp8 (32x32 blocks; default), int4 (~1.7% perplexity), bf16
+_VOCAB_FORMAT = __import__("os").environ.get("VLLM_DS41_VOCAB_FORMAT", "fp8")
+_ROUTER_F32_CACHE = __import__("os").environ.get("VLLM_DS41_ROUTER_F32_CACHE") == "1"
+
+
+def _has_submodule(m: nn.Module, name: str) -> bool:
+    try:
+        m.get_submodule(name)
+        return True
+    except AttributeError:
+        return False
 
 
 def _avail_mib() -> int:
@@ -165,9 +178,13 @@ class XpuOffloadMoE(nn.Module):
 
     def _route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """sqrt(softplus) scores, top-k on scores + bias, renormalized x scale."""
-        if self._gate_f32 is None:
-            self._gate_f32 = self.gate.weight.float()
-        logits = F.linear(x.float(), self._gate_f32)
+        if _ROUTER_F32_CACHE:
+            if self._gate_f32 is None:
+                self._gate_f32 = self.gate.weight.float()
+            gate_w = self._gate_f32
+        else:
+            gate_w = self.gate.weight.float()  # temporary: no persistent fp32 copy
+        logits = F.linear(x.float(), gate_w)
         if _TORCH_ROUTER:
             scores = F.softplus(logits).sqrt()
             idx = (scores + self.gate.e_score_correction_bias).topk(self.topk, dim=-1)[1]
@@ -636,7 +653,8 @@ class DeepseekV41LLMForCausalLM(nn.Module, SupportsPP):
         for m in self.modules():
             if isinstance(m, DeepseekV41XPUAttention):
                 m.prepare_decode_weights()
-            elif isinstance(m, XpuOffloadMoE) and m._gate_f32 is None:
+            elif (isinstance(m, XpuOffloadMoE) and m._gate_f32 is None
+                  and _ROUTER_F32_CACHE):
                 m._gate_f32 = m.gate.weight.float()
         from . import int4_linear
 
@@ -645,6 +663,27 @@ class DeepseekV41LLMForCausalLM(nn.Module, SupportsPP):
             logger.info("DeepSeek V4.1 XPU: %d dense linears stored as INT4 (group %d): "
                         "%.2f GiB -> %.2f GiB on this GPU", n4, int4_linear.GROUP,
                         b0 / 2**30, b1 / 2**30)
+            extra0 = extra1 = 0
+            if _INT4_WO_A:
+                for m in self.modules():
+                    if (isinstance(m, DeepseekV41XPUAttention)
+                            and m.wo_a.weight.dtype == torch.float8_e4m3fn):
+                        a, b = int4_linear.convert_grouped_to_int4(m.wo_a, m.n_local_groups)
+                        m._wo_a_sf = None
+                        extra0, extra1 = extra0 + a, extra1 + b
+            if _VOCAB_FORMAT in ("fp8", "int4"):
+                conv = (int4_linear.convert_vocab_to_fp8 if _VOCAB_FORMAT == "fp8"
+                        else int4_linear.convert_vocab_to_int4)
+                for name in ("model.embed_tokens", "lm_head"):
+                    if not _has_submodule(self, name):
+                        continue
+                    layer = self.get_submodule(name)
+                    if layer.weight.dtype == torch.bfloat16:
+                        a, b = conv(layer)
+                        extra0, extra1 = extra0 + a, extra1 + b
+            logger.info("DeepSeek V4.1 XPU: wo_a %s, embedding / LM head %s: "
+                        "%.2f GiB -> %.2f GiB on this GPU", "int4" if _INT4_WO_A else "fp8",
+                        _VOCAB_FORMAT, extra0 / 2**30, extra1 / 2**30)
         from .fp8_gemv import install_decode_fp8_linears
 
         n = install_decode_fp8_linears(self, skip=(".wo_a",))

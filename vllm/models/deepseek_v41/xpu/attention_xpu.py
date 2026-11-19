@@ -197,7 +197,8 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
     def prepare_decode_weights(self) -> None:
         """float32 copy of wo_a's block scales for the decode GEMV; made after
         loading so graph capture does not record it."""
-        if self.wo_a.weight.dtype != torch.float8_e4m3fn:
+        if (self.wo_a.weight.dtype != torch.float8_e4m3fn
+                or getattr(self.wo_a, "int4_groups", None) is not None):
             return
         s = getattr(self.wo_a, "weight_scale_inv", None)
         if s is None:
@@ -217,6 +218,10 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
         if _TRITON_ROPE and not _WO_A_BMM:
             # inverse RoPE + FP8 round trip in one launch; same values
             ob = inv_rope_fp8_round(o, positions, self.rotary_emb.cos_sin_cache).view(T, g, -1)
+            if getattr(self.wo_a, "int4_groups", None) is not None:
+                from .int4_linear import grouped_int4_matmul
+
+                return self._wo_b_proj(grouped_int4_matmul(self.wo_a, ob).flatten(1))
             if T <= _WO_A_GEMV_MAX_TOKENS and self.wo_a.weight.dtype == torch.float8_e4m3fn:
                 if self._wo_a_sf is None:
                     self.prepare_decode_weights()
