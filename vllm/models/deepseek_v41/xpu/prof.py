@@ -7,7 +7,8 @@ nested section's time is also inside its parent's, and summary names show
 the path ("attention/o_proj"). With VLLM_DS41_PROF_OPS=1 a torch dispatch
 mode also counts the torch ops each section runs (innermost section).
 Rank 0 logs a summary every VLLM_DS41_PROF_EVERY decode steps (default 50).
-Eager mode only (the syncs cannot be captured in a graph)."""
+The first VLLM_DS41_PROF_SKIP (20) decode steps are not counted: they
+compile Triton kernels. Eager mode only (the syncs cannot be captured)."""
 from __future__ import annotations
 
 import os
@@ -24,6 +25,8 @@ logger = init_logger(__name__)
 ENABLED = os.environ.get("VLLM_DS41_PROF") == "1"
 _COUNT_OPS = ENABLED and os.environ.get("VLLM_DS41_PROF_OPS") == "1"
 _EVERY = int(os.environ.get("VLLM_DS41_PROF_EVERY", "50"))
+# decode steps not counted at the start (first calls compile Triton kernels)
+_SKIP = int(os.environ.get("VLLM_DS41_PROF_SKIP", "20"))
 _tot: dict[str, float] = defaultdict(float)
 _ops: dict[str, int] = defaultdict(int)
 _stack: list[str] = []
@@ -41,6 +44,9 @@ def begin_step(num_tokens: int) -> None:
     if not ENABLED:
         return
     _state["active"] = num_tokens == 1 and not torch.xpu.is_current_stream_capturing()
+    if _state["active"] and _state.get("seen", 0) < _SKIP:
+        _state["seen"] = _state.get("seen", 0) + 1
+        _state["active"] = False
     if _state["active"]:
         torch.accelerator.synchronize()
         _state["t0"] = time.perf_counter()

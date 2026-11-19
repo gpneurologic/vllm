@@ -39,7 +39,7 @@ def _gemv_kernel(x_ptr, w_ptr, s_ptr, y_ptr, R, K, G,
     tl.store(y_ptr + (pk * n_tok + t) * (G * R) + rows, acc.to(y_ptr.dtype.element_ty))
 
 
-def _launch(x3, w, s, groups, out_dtype, block_n, block_k, k_per):
+def _launch(x3, w, s, groups, out_dtype, block_n, block_k, k_per, num_warps=4):
     T, G, K = x3.shape
     N = w.shape[0]
     R = N // G
@@ -48,7 +48,7 @@ def _launch(x3, w, s, groups, out_dtype, block_n, block_k, k_per):
                     device=x3.device)
     _gemv_kernel[(T, N // block_n, split)](
         x3, w, s, y, R, K, G, x3.stride(0), x3.stride(1), w.stride(0), s.stride(0), s.stride(1),
-        T, BLOCK_N=block_n, BLOCK_K=block_k, K_PER=k_per,
+        T, BLOCK_N=block_n, BLOCK_K=block_k, K_PER=k_per, num_warps=num_warps,
     )
     if split == 1:
         return y[0]
@@ -79,6 +79,46 @@ def block_scales_f32(s: torch.Tensor) -> torch.Tensor:
 
 
 _MAX_TOKENS = int(os.environ.get("VLLM_DS41_FP8_GEMV_MAX_TOKENS", "16"))
+_TUNE = os.environ.get("VLLM_DS41_FP8_GEMV_TUNE", "1") == "1"
+
+
+# (BLOCK_N, BLOCK_K, K_PER or 0 = whole K, num_warps) candidates for the
+# per-shape tuning at load time (the best one differs a lot by shape).
+_CANDIDATES = [(bn, bk, kp, nw) for bn, bk, kp in
+               ((8, 128, 1), (8, 512, 4), (16, 128, 2), (32, 256, 0), (64, 128, 1),
+                (64, 128, 2), (64, 256, 4), (64, 128, 0)) for nw in (2, 4, 8)]
+_tuned: dict[tuple, tuple] = {}
+
+
+def _tune(w: torch.Tensor, s: torch.Tensor) -> tuple:
+    """Fastest launch config for this weight shape (one token), cached."""
+    import time
+
+    N, K = w.shape
+    key = (N, K, w.device)
+    if key in _tuned:
+        return _tuned[key]
+    x = torch.randn(1, 1, K, device=w.device).to(torch.bfloat16)
+    best = None
+    for bn, bk, kp, nw in _CANDIDATES:
+        if N % bn:
+            continue
+        kpe = triton.cdiv(K, bk) if kp == 0 else min(kp, triton.cdiv(K, bk))
+        try:
+            for _ in range(3):
+                _launch(x, w, s, 1, torch.bfloat16, bn, bk, kpe, nw)
+            torch.accelerator.synchronize()
+            t = time.perf_counter()
+            for _ in range(20):
+                _launch(x, w, s, 1, torch.bfloat16, bn, bk, kpe, nw)
+            torch.accelerator.synchronize()
+            dt = time.perf_counter() - t
+        except Exception:  # noqa: BLE001 - a config may not compile
+            continue
+        if best is None or dt < best[0]:
+            best = (dt, (bn, bk, kpe, nw))
+    _tuned[key] = best[1] if best else (32, 256, triton.cdiv(K, 256), 4)
+    return _tuned[key]
 
 
 class DecodeFp8Linear:
@@ -89,18 +129,17 @@ class DecodeFp8Linear:
     def __init__(self, orig, layer: torch.nn.Module, scales: torch.Tensor):
         self._orig = orig
         self._sf = scales
-        N, K = layer.weight.shape
-        # one program per 32 output rows over the whole K: no split-K pass
-        self._cfg = (32, 256, triton.cdiv(K, 256))
+        self._cfg = _tune(layer.weight.data, scales) if _TUNE else (
+            32, 256, triton.cdiv(layer.weight.shape[1], 256), 4)
 
     def __getattr__(self, name):
         return getattr(self._orig, name)
 
     def apply(self, layer, x, bias=None):
         if x.dim() == 2 and x.shape[0] <= _MAX_TOKENS and x.shape[0] > 0:
-            bn, bk, kp = self._cfg
+            bn, bk, kp, nw = self._cfg
             y = _launch(x.contiguous().view(x.shape[0], 1, -1), layer.weight, self._sf, 1,
-                        x.dtype, bn, bk, kp)
+                        x.dtype, bn, bk, kp, nw)
             return y if bias is None else y + bias
         return self._orig.apply(layer, x, bias)
 
@@ -128,4 +167,9 @@ def install_decode_fp8_linears(model: torch.nn.Module, skip=()) -> int:
             continue
         m.quant_method = DecodeFp8Linear(m.quant_method, m, block_scales_f32(s.data))
         n += 1
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info("decode FP8 GEMV configs (N, K) -> (BLOCK_N, BLOCK_K, "
+                               "K_PER, warps): %s",
+                               {k[:2]: v for k, v in _tuned.items()})
     return n

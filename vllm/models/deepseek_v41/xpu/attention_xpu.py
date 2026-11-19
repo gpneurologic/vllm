@@ -304,20 +304,18 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
         if not swa_only:
             assert attn_metadata is not None and self.topk_indices_buffer is not None
             block_size = attn_metadata.block_size // self.compress_ratio
-            global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                self.topk_indices_buffer[:nd],
-                swa_metadata.token_to_req_indices,
-                attn_metadata.block_table[:num_decodes],
-                block_size,
-                swa_metadata.is_valid_token[:nd],
-            )
+            with prof.section("topk_global"):
+                global_indices, topk_lens = compute_global_topk_indices_and_lens(
+                    self.topk_indices_buffer[:nd],
+                    swa_metadata.token_to_req_indices,
+                    attn_metadata.block_table[:num_decodes],
+                    block_size,
+                    swa_metadata.is_valid_token[:nd],
+                )
             topk_indices = global_indices.view(nd, 1, -1)
         if nd <= _FUSED_DECODE_MAX_TOKENS:
-            sparse_decode_fused(
-                q, kv_cache, self.swa_cache_layer.kv_cache, topk_indices, topk_lens,
-                swa_metadata.decode_swa_indices, swa_metadata.decode_swa_lens,
-                self.attn_sink, self.scale, output,
-            )
+            with prof.section("fused_decode"):
+                self._fused_decode(q, kv_cache, topk_indices, topk_lens, swa_metadata, output)
             return
         xpu_sparse_decode_fp8(
             q=q,
@@ -334,6 +332,13 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
             nope_head_dim=self.nope_head_dim,
             rope_head_dim=self.rope_head_dim,
             out=output,
+        )
+
+    def _fused_decode(self, q, kv_cache, topk_indices, topk_lens, swa_metadata, output):
+        sparse_decode_fused(
+            q, kv_cache, self.swa_cache_layer.kv_cache, topk_indices, topk_lens,
+            swa_metadata.decode_swa_indices, swa_metadata.decode_swa_lens,
+            self.attn_sink, self.scale, output,
         )
 
     def _forward_prefill(self, q, compressed_k_cache, swa_k_cache, output,
