@@ -12,6 +12,7 @@ and prefill-context parallel). XPU-specific parts:
 - the Engram tables are read from the checkpoint mmap (`offload.DiskEngramEmbedding`).
 """
 
+import os
 import typing
 from collections.abc import Iterable
 from itertools import islice
@@ -74,6 +75,25 @@ _INT4_WO_A = __import__("os").environ.get("VLLM_DS41_INT4_WO_A", "0") == "1"
 # embedding / LM head: fp8 (32x32 blocks; default), int4 (~1.7% perplexity), bf16
 _VOCAB_FORMAT = __import__("os").environ.get("VLLM_DS41_VOCAB_FORMAT", "fp8")
 _ROUTER_F32_CACHE = __import__("os").environ.get("VLLM_DS41_ROUTER_F32_CACHE") == "1"
+
+
+def _expert_range(n_routed: int, tp: int, rank: int, layer: int) -> tuple[int, int]:
+    """(first expert, count) of this rank's routed experts in `layer`.
+
+    VLLM_DS41_EXPERT_SPLIT="63,64,65;63,65,64" gives per-rank counts, one
+    pattern per layer, cycled. It evens out free memory when a card carries
+    extra fixed overhead (card 0 gets ~185 MiB more driver memory from every
+    vLLM process). Unset or malformed: an even split."""
+    spec = os.environ.get("VLLM_DS41_EXPERT_SPLIT", "").strip()
+    if spec:
+        pats = [[int(c) for c in pat.split(",")] for pat in spec.split(";") if pat.strip()]
+        if pats and all(len(c) == tp and sum(c) == n_routed and min(c) > 0 for c in pats):
+            counts = pats[layer % len(pats)]
+            return sum(counts[:rank]), counts[rank]
+        logger.warning_once("DeepSeek V4.1 XPU: ignoring VLLM_DS41_EXPERT_SPLIT=%r "
+                            "(need %d counts summing to %d per pattern)", spec, tp, n_routed)
+    n = n_routed // tp
+    return rank * n, n
 
 
 def _has_submodule(m: nn.Module, name: str) -> bool:
@@ -158,8 +178,9 @@ class XpuOffloadMoE(nn.Module):
         self.route_scale = config.routed_scaling_factor
         self.swiglu_limit = float(config.swiglu_limit or 0.0)
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.n_local = self.n_routed // self.tp_size
-        self.e_start = get_tensor_model_parallel_rank() * self.n_local
+        self.e_start, self.n_local = _expert_range(
+            self.n_routed, self.tp_size, get_tensor_model_parallel_rank(),
+            int(self.prefix_ckpt.split(".")[1]))
         self.gate = _Gate(self.n_routed, config.hidden_size)
         self.shared_experts = DeepseekV4MLP(
             hidden_size=config.hidden_size,

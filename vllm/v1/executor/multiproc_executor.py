@@ -12,7 +12,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Sequence, Sized
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -739,6 +739,56 @@ class WorkerProcHandle:
         )
 
 
+_XPU_ISOLATE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _xpu_isolated_worker_env(vllm_config: VllmConfig, local_rank: int):
+    """Per-worker environment for XPU multiproc workers.
+
+    VLLM_XPU_ISOLATE_WORKERS=1 starts each worker with ZE_AFFINITY_MASK set to
+    its own card only, so it creates no driver context on the other cards.
+    With EnableDeferBacking=0 every such context pins ~245 MiB of VRAM per card
+    per process, and card 0 gets ~185 MiB more from every process. oneCCL then
+    hangs on messages above its "medium" size unless the
+    CCL_SYCL_*_MEDIUM_THRESHOLD variables are raised. Single-node, DP=1 only.
+
+    VLLM_XPU_WORKER_ENV ("K=V,K2=V2") sets variables for the workers only, e.g.
+    EnableDeferBacking=0 while the API process keeps the driver default.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_xpu() or get_mp_context().get_start_method() != "spawn":
+        yield
+        return
+    env: dict[str, str] = {}
+    for kv in filter(None, os.environ.get("VLLM_XPU_WORKER_ENV", "").split(",")):
+        k, _, v = kv.partition("=")
+        env[k.strip()] = v.strip()
+    if (
+        os.environ.get("VLLM_XPU_ISOLATE_WORKERS", "0") == "1"
+        and vllm_config.parallel_config.data_parallel_size == 1
+    ):
+        mask = os.environ.get("ZE_AFFINITY_MASK", "")
+        cards = mask.split(",") if mask else None
+        env["ZE_AFFINITY_MASK"] = cards[local_rank] if cards else str(local_rank)
+        env["VLLM_XPU_ISOLATED_WORKER"] = "1"
+    if not env:
+        yield
+        return
+    with _XPU_ISOLATE_LOCK:
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            yield
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
@@ -884,8 +934,11 @@ class WorkerProc:
         )
 
         # Apply NUMA binding if configured
-        with numa_utils.configure_subprocess(
-            vllm_config, local_rank, process_kind="worker"
+        with (
+            numa_utils.configure_subprocess(
+                vllm_config, local_rank, process_kind="worker"
+            ),
+            _xpu_isolated_worker_env(vllm_config, local_rank),
         ):
             proc.start()
 

@@ -354,6 +354,13 @@ class XPUPlatform(Platform):
         return None
 
     @classmethod
+    def logical_device_id_to_visible_device_id(cls, device_id: int) -> int:
+        # A worker started with VLLM_XPU_ISOLATE_WORKERS sees only its own card.
+        if os.environ.get("VLLM_XPU_ISOLATED_WORKER") == "1":
+            return 0
+        return super().logical_device_id_to_visible_device_id(device_id)
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.xpu.get_device_name(device_id)
 

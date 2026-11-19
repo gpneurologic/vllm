@@ -145,7 +145,12 @@ class StatelessGroupCoordinator(GroupCoordinator):
             )
             self.device = torch.device(f"cuda:{visible_device_index}")
         elif current_platform.is_xpu():
-            self.device = torch.device(f"xpu:{self.device_index}")
+            visible_device_index = (
+                current_platform.logical_device_id_to_visible_device_id(
+                    self.device_index
+                )
+            )
+            self.device = torch.device(f"xpu:{visible_device_index}")
         elif current_platform.is_out_of_tree():
             self.device = torch.device(
                 f"{current_platform.device_name}:{self.device_index}"

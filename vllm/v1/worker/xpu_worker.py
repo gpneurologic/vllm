@@ -149,7 +149,7 @@ class XPUWorker(Worker):
                         " exceeds assigned_physical_gpu_ids count "
                         f"({len(assigned_physical_gpu_ids)})"
                     )
-            else:
+            elif os.environ.get("VLLM_XPU_ISOLATED_WORKER") != "1":
                 assert self.local_rank < torch.accelerator.device_count(), (
                     f"DP adjusted local rank {self.local_rank} is out of "
                     f"bounds for {torch.accelerator.device_count()} devices."
