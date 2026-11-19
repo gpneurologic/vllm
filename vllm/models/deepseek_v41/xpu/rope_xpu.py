@@ -70,7 +70,8 @@ def _inv_rope_round_kernel(x_ptr, pos_ptr, cs_ptr, y_ptr, s_t, s_h, H, cs_stride
     s = -tl.load(cs_ptr + p * cs_stride + half + pair, mask=in_rope, other=0.0).to(tl.float32)
     even = (i % 2) == 0
     rot = tl.where(even, x * c - xp * s, xp * s + x * c)
-    x = tl.where(in_rope, rot, x)
+    # the torch path stores the rotated values as bf16 before rounding
+    x = tl.where(in_rope, rot.to(tl.bfloat16).to(tl.float32), x)
     # FP8 round trip, power-of-two scale per 32 values:
     # s = 2^ceil(log2(max(amax, 1e-4) / 448))
     amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)  # [nb]
