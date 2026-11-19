@@ -180,7 +180,7 @@ def _deq_groups(bp, grid64_ptr, sign_ptr, QTYPE: tl.constexpr):
 def _gemv_kernel_v2(x_ptr, w_ptr, eid_ptr, y_ptr, grid64_ptr, sign_ptr,
                     N, K, row_bytes, expert_stride, n_pairs,
                     QTYPE: tl.constexpr, BB: tl.constexpr, BLOCK_N: tl.constexpr,
-                    KB_PER: tl.constexpr):
+                    KB_PER: tl.constexpr, ACC3: tl.constexpr = False):
     pid_p = tl.program_id(0)
     pid_n = tl.program_id(1)
     pid_k = tl.program_id(2)
@@ -194,13 +194,19 @@ def _gemv_kernel_v2(x_ptr, w_ptr, eid_ptr, y_ptr, grid64_ptr, sign_ptr,
     acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     row_base = w_ptr + e.to(tl.int64) * expert_stride + rows.to(tl.int64) * row_bytes
     xo = tl.arange(0, 32)[:, None] * 8 + tl.arange(0, 8)[None, :]  # [32, 8]
+    acc3 = tl.zeros([BLOCK_N, 32, 8], dtype=tl.float32)
     for i in range(KB_PER):
         kb = pid_k * KB_PER + i
         if kb < n_kb:
             bp = (row_base + kb * BB)[:, None]
             w = _deq_groups(bp, grid64_ptr, sign_ptr, QTYPE)  # [BN, 32, 8]
             xv = tl.load(x_ptr + pid_p * K + kb * 256 + xo).to(tl.float32)  # [32, 8]
-            acc += tl.sum(tl.sum(w * xv[None, :, :], axis=2), axis=1)
+            if ACC3:
+                acc3 += w * xv[None, :, :]  # reduce once, after the loop
+            else:
+                acc += tl.sum(tl.sum(w * xv[None, :, :], axis=2), axis=1)
+    if ACC3:
+        acc = tl.sum(tl.sum(acc3, axis=2), axis=1)
     tl.store(y_ptr + (pid_k * n_pairs + pid_p) * N + rows, acc, mask=rmask)
 
 
@@ -233,7 +239,8 @@ _V2_CFG = {
 
 def gguf_gemv(x: torch.Tensor, w: torch.Tensor, eid: torch.Tensor, qtype: int,
               block_n: int | None = None, kb_per: int | None = None,
-              version: int | None = None, num_warps: int | None = None) -> torch.Tensor:
+              version: int | None = None, num_warps: int | None = None,
+              acc3: bool = False) -> torch.Tensor:
     """x [P, K] (bf16/fp32), w [E, N, row_bytes] uint8, eid [P] int32 (-1 = skip).
     Returns float32 [P, N]: row p = W[eid[p]] @ x[p] (zeros where eid = -1)."""
     P, K = x.shape
@@ -256,7 +263,7 @@ def gguf_gemv(x: torch.Tensor, w: torch.Tensor, eid: torch.Tensor, qtype: int,
         _gemv_kernel_v2[(P, triton.cdiv(N, block_n), split)](
             x, w, eid, y, grid64, sign_t, N, K, rb, w.stride(0), P,
             QTYPE=qtype, BB=_BLOCK_BYTES[qtype], BLOCK_N=block_n, KB_PER=kb_per,
-            num_warps=num_warps,
+            num_warps=num_warps, ACC3=acc3,
         )
     else:
         _gemv_kernel[(P, triton.cdiv(N, block_n), split)](
@@ -342,12 +349,46 @@ def _gemv3(x, w, idx_flat, qtype, e_start, n_local, xdiv):
 
 
 _FUSED_GLUE = __import__("os").environ.get("VLLM_DS41_MOE_FUSED_GLUE", "1") == "1"
+_SYCL = __import__("os").environ.get("VLLM_DS41_MOE_SYCL", "1") == "1"
+_sycl_ok: bool | None = None
+
+
+def _use_sycl() -> bool:
+    """The SYCL kernels when the library is built (and not turned off)."""
+    global _sycl_ok
+    if _sycl_ok is None:
+        from . import iq_mmvq as iq
+
+        _sycl_ok = _SYCL and iq.available()
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "DeepSeek V4.1 GGUF decode experts: %s",
+            "SYCL q8_1 kernels" if _sycl_ok else "Triton kernels")
+    return _sycl_ok
 
 
 def moe_decode(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
     """Add the local experts' outputs for all (token, slot) pairs to out
     (float32 [T, H]); no host sync."""
     T, k = idx.shape
+    if _use_sycl():
+        # llama.cpp-style SYCL kernels with q8_1 activations (iq_mmvq.py)
+        from . import iq_mmvq as iq
+
+        idx_flat = idx.reshape(-1).to(torch.int32)
+        H = x.shape[1]
+        h = iq.moe_mmvq(iq.quantize_q8_1(x.contiguous()), H, w13, t13, idx_flat, e_start,
+                        n_local, k)  # [P, 2I]
+        P, I2 = h.shape
+        I = I2 // 2
+        a = torch.empty(P, I, dtype=torch.float32, device=x.device)
+        _swiglu_kernel[(P, triton.cdiv(I, 1024))](h, a, I, float(limit or 0.0),
+                                                  HAS_LIMIT=bool(limit), BLOCK=1024)
+        y = iq.moe_mmvq(iq.quantize_q8_1(a), I, w2, t2, idx_flat, e_start, n_local, 1)
+        _combine_kernel[(T, triton.cdiv(H, 1024))](y, w.contiguous(), out, H, K_TOP=k,
+                                                   KP=triton.next_power_of_2(k), BLOCK=1024)
+        return
     if _FUSED_GLUE and _KERNEL_V == 2:
         idx_flat = idx.reshape(-1)
         x = x.contiguous()
