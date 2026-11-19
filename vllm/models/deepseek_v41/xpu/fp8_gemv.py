@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Grouped FP8 GEMV with 32x32 power-of-two block scales (decode wo_a).
+"""FP8 GEMV with 32x32 power-of-two block scales, for decode.
 
 z[t, g, r] = sum_k x[t, g, k] * W[g*R + r, k] * S[(g*R + r) // 32, k // 32]
 
-W is the stored FP8 e4m3 weight [G*R, K]; S its block scales (any float or
-e8m0 dtype, any strides). Split-K partial sums are added afterwards."""
+W is the stored FP8 e4m3 weight [G*R, K]; S its block scales (float, any
+strides). `fp8_grouped_gemv` serves wo_a (G groups); `DecodeFp8Linear`
+puts the G = 1 case in front of every block-FP8 linear for small batches,
+replacing the per-token activation quant + oneDNN GEMM (several launches)
+with one kernel."""
 from __future__ import annotations
+
+import os
 
 import torch
 import triton
@@ -31,26 +36,96 @@ def _gemv_kernel(x_ptr, w_ptr, s_ptr, y_ptr, R, K, G,
         sc = tl.load(s_ptr + (rows // 32)[:, None] * ss_n + (ks // 32)[None, :] * ss_k,
                      mask=km[None, :], other=0.0).to(tl.float32)
         acc += tl.sum(w.to(tl.float32) * sc * xv[None, :], axis=1)
-    tl.store(y_ptr + (pk * n_tok + t) * (G * R) + rows, acc)
+    tl.store(y_ptr + (pk * n_tok + t) * (G * R) + rows, acc.to(y_ptr.dtype.element_ty))
+
+
+def _launch(x3, w, s, groups, out_dtype, block_n, block_k, k_per):
+    T, G, K = x3.shape
+    N = w.shape[0]
+    R = N // G
+    split = triton.cdiv(triton.cdiv(K, block_k), k_per)
+    y = torch.empty(split, T, N, dtype=out_dtype if split == 1 else torch.float32,
+                    device=x3.device)
+    _gemv_kernel[(T, N // block_n, split)](
+        x3, w, s, y, R, K, G, x3.stride(0), x3.stride(1), w.stride(0), s.stride(0), s.stride(1),
+        T, BLOCK_N=block_n, BLOCK_K=block_k, K_PER=k_per,
+    )
+    if split == 1:
+        return y[0]
+    return y.sum(0).to(out_dtype)
 
 
 def fp8_grouped_gemv(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor, groups: int,
                      block_n: int = 32, block_k: int = 256, k_per: int = 2) -> torch.Tensor:
-    """x [T, G, K] (any float dtype), w [G*R, K] fp8, s [G*R/32, K/32].
+    """x [T, G, K] (any float dtype), w [G*R, K] fp8, s [G*R/32, K/32] float.
     Returns float32 [T, G, R]."""
     T, G, K = x.shape
     N = w.shape[0]
     assert G == groups and N % G == 0 and w.shape[1] == K and w.stride(1) == 1
-    R = N // G
-    assert R % block_n == 0 and block_n % 32 == 0 or 32 % block_n == 0
+    assert (N // G) % block_n == 0
     if s.dtype == torch.float8_e8m0fnu:
         s = s.view(torch.uint8).to(torch.int32).sub(127).float().exp2()
-    x = x.contiguous()
-    split = triton.cdiv(triton.cdiv(K, block_k), k_per)
-    y = torch.empty(split, T, N, dtype=torch.float32, device=x.device)
-    _gemv_kernel[(T, N // block_n, split)](
-        x, w, s, y, R, K, G, x.stride(0), x.stride(1), w.stride(0), s.stride(0), s.stride(1), T,
-        BLOCK_N=block_n, BLOCK_K=block_k, K_PER=k_per,
-    )
-    y = y.sum(0) if split > 1 else y[0]
-    return y.view(T, G, R)
+    y = _launch(x.contiguous(), w, s, G, torch.float32, block_n, block_k, k_per)
+    return y.view(T, G, N // G)
+
+
+def block_scales_f32(s: torch.Tensor) -> torch.Tensor:
+    """Block scales in any stored dtype -> contiguous float32."""
+    if s.dtype == torch.float8_e8m0fnu:
+        s = s.view(torch.uint8).to(torch.int32).sub(127).float().exp2()
+    elif s.dtype == torch.uint8:
+        s = s.to(torch.int32).sub(127).float().exp2()
+    return s.float().contiguous()
+
+
+_MAX_TOKENS = int(os.environ.get("VLLM_DS41_FP8_GEMV_MAX_TOKENS", "16"))
+
+
+class DecodeFp8Linear:
+    """Per-layer proxy for a block-FP8 linear's quant method: up to
+    `_MAX_TOKENS` tokens run one Triton GEMV on the stored weight; larger
+    batches (and anything unexpected) use the original method."""
+
+    def __init__(self, orig, layer: torch.nn.Module, scales: torch.Tensor):
+        self._orig = orig
+        self._sf = scales
+        N, K = layer.weight.shape
+        # one program per 32 output rows over the whole K: no split-K pass
+        self._cfg = (32, 256, triton.cdiv(K, 256))
+
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+    def apply(self, layer, x, bias=None):
+        if x.dim() == 2 and x.shape[0] <= _MAX_TOKENS and x.shape[0] > 0:
+            bn, bk, kp = self._cfg
+            y = _launch(x.contiguous().view(x.shape[0], 1, -1), layer.weight, self._sf, 1,
+                        x.dtype, bn, bk, kp)
+            return y if bias is None else y + bias
+        return self._orig.apply(layer, x, bias)
+
+
+def install_decode_fp8_linears(model: torch.nn.Module, skip=()) -> int:
+    """Put DecodeFp8Linear in front of every 32x32 block-FP8 linear layer."""
+    if os.environ.get("VLLM_DS41_FP8_GEMV", "1") != "1":
+        return 0
+    from vllm.model_executor.layers.linear import LinearBase
+
+    n = 0
+    for name, m in model.named_modules():
+        if not isinstance(m, LinearBase) or any(k in name for k in skip):
+            continue
+        w = getattr(m, "weight", None)
+        if w is None or w.dtype != torch.float8_e4m3fn or w.dim() != 2 or w.stride(1) != 1:
+            continue
+        s = getattr(m, "weight_scale_inv", None)
+        if s is None:
+            s = getattr(m, "weight_scale", None)
+        N, K = w.shape
+        if s is None or tuple(s.shape) != (N // 32, K // 32) or N % 32 or K % 32:
+            continue
+        if isinstance(m.quant_method, DecodeFp8Linear):
+            continue
+        m.quant_method = DecodeFp8Linear(m.quant_method, m, block_scales_f32(s.data))
+        n += 1
+    return n

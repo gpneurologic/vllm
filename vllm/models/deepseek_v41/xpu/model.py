@@ -638,6 +638,10 @@ class DeepseekV41LLMForCausalLM(nn.Module, SupportsPP):
                 m.prepare_decode_weights()
             elif isinstance(m, XpuOffloadMoE) and m._gate_f32 is None:
                 m._gate_f32 = m.gate.weight.float()
+        from .fp8_gemv import install_decode_fp8_linears
+
+        n = install_decode_fp8_linears(self, skip=(".wo_a",))
+        logger.info("DeepSeek V4.1 XPU: decode FP8 GEMV on %d block-FP8 linear layers", n)
 
 
 __all__ = [
