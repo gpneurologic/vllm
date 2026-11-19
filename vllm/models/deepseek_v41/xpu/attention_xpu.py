@@ -41,6 +41,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 from . import prof
 from .fp8_gemv import fp8_grouped_gemv
+from .rope_xpu import gptj_rope_, inv_rope_fp8_round
+from .sparse_decode_xpu import sparse_decode_fused
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -123,6 +125,8 @@ def _act_fp8_quant(x: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torc
 
 
 _WO_A_BMM = __import__("os").environ.get("VLLM_DS41_WO_A_BMM") == "1"
+_TRITON_ROPE = __import__("os").environ.get("VLLM_DS41_TRITON_ROPE", "1") == "1"
+_FUSED_DECODE_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_FUSED_DECODE_MAX_TOKENS", "16"))
 _WO_A_GEMV_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_WO_A_GEMV_MAX_TOKENS", "16"))
 
 
@@ -172,14 +176,15 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
     # ---------------------------------------------------------------- KV insert
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         cos_sin = self.rotary_emb.cos_sin_cache
-        _gptj_rope(q, positions, cos_sin)
+        rope = gptj_rope_ if _TRITON_ROPE else _gptj_rope
+        rope(q, positions, cos_sin)
         if not isinstance(attn_metadata, dict):
             return q
         swa_metadata = cast(
             "DeepseekSparseSWAMetadata", attn_metadata[self.swa_cache_layer.prefix]
         )
         kv_roped = kv.clone()
-        _gptj_rope(kv_roped, positions, cos_sin)
+        rope(kv_roped, positions, cos_sin)
         cache = self.swa_cache_layer.kv_cache
         quantize_and_insert_k_cache(
             kv_roped,
@@ -207,10 +212,19 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
     # ---------------------------------------------------------------- output proj
     def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         o = attn_out[:, : self.n_local_heads]
-        _gptj_rope(o, positions, self.rotary_emb.cos_sin_cache, inverse=True)
         g = self.n_local_groups
-        o = o.reshape(o.shape[0], g, -1)
         T = o.shape[0]
+        if _TRITON_ROPE and not _WO_A_BMM:
+            # inverse RoPE + FP8 round trip in one launch; same values
+            ob = inv_rope_fp8_round(o, positions, self.rotary_emb.cos_sin_cache).view(T, g, -1)
+            if T <= _WO_A_GEMV_MAX_TOKENS and self.wo_a.weight.dtype == torch.float8_e4m3fn:
+                if self._wo_a_sf is None:
+                    self.prepare_decode_weights()
+                z = fp8_grouped_gemv(ob, self.wo_a.weight.data, self._wo_a_sf, g)
+                return self._wo_b_proj(z.to(torch.bfloat16).flatten(1))
+            return self._wo_b_proj(self._wo_a_dequant_einsum(ob, g).flatten(1))
+        _gptj_rope(o, positions, self.rotary_emb.cos_sin_cache, inverse=True)
+        o = o.reshape(o.shape[0], g, -1)
         if _WO_A_BMM and getattr(self.wo_a, "bmm_weight", None) is not None:
             # oneDNN FP8 grouped GEMM (opt-in: slower end to end in decode).
             q, qs = _act_fp8_quant(o)
@@ -229,7 +243,11 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
             z = fp8_grouped_gemv(ob, self.wo_a.weight.data, self._wo_a_sf, g)
             return self._wo_b_proj(z.to(torch.bfloat16).flatten(1))
         o = _act_fp8_roundtrip(o).to(torch.bfloat16)
-        # Fallback: dequantize wo_a per call (no bf16 copy kept).
+        return self._wo_b_proj(self._wo_a_dequant_einsum(o, g).flatten(1))
+
+    def _wo_a_dequant_einsum(self, o: torch.Tensor, g: int) -> torch.Tensor:
+        """Fallback for larger batches: dequantize wo_a per call (no bf16 copy
+        kept) and run a grouped einsum. o [T, g, K] bf16 -> [T, g, R]."""
         w = self.wo_a.weight
         s = getattr(self.wo_a, "weight_scale_inv", None)
         if s is None:
@@ -237,8 +255,7 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
         wf = _dequant_block_fp8(w.data, s.data) if w.dtype != torch.bfloat16 else w.float()
         wo_a = wf.to(torch.bfloat16).view(g, self.o_lora_rank, -1)
         del wf
-        z = torch.einsum("tgd,grd->tgr", o, wo_a)
-        return self._wo_b_proj(z.flatten(1))
+        return torch.einsum("tgd,grd->tgr", o, wo_a)
 
     # ---------------------------------------------------------------- attention
     def forward_mqa(self, q, kv, positions, output) -> None:
@@ -295,6 +312,13 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
                 swa_metadata.is_valid_token[:nd],
             )
             topk_indices = global_indices.view(nd, 1, -1)
+        if nd <= _FUSED_DECODE_MAX_TOKENS:
+            sparse_decode_fused(
+                q, kv_cache, self.swa_cache_layer.kv_cache, topk_indices, topk_lens,
+                swa_metadata.decode_swa_indices, swa_metadata.decode_swa_lens,
+                self.attn_sink, self.scale, output,
+            )
+            return
         xpu_sparse_decode_fp8(
             q=q,
             kv_cache=kv_cache,
