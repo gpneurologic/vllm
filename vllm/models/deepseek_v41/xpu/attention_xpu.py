@@ -45,6 +45,7 @@ from .kv_int4_sim import install as _install_kv_int4_sim, int4_roundtrip_
 from .rope_xpu import gptj_rope_, inv_rope_fp8_round
 from .sparse_decode_xpu import sparse_decode_fused
 from .sparse_prefill_xpu import sparse_prefill_attn
+from . import kv_int4
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -129,6 +130,7 @@ def _act_fp8_quant(x: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torc
 _WO_A_BMM = __import__("os").environ.get("VLLM_DS41_WO_A_BMM") == "1"
 _TRITON_ROPE = __import__("os").environ.get("VLLM_DS41_TRITON_ROPE", "1") == "1"
 _install_kv_int4_sim()
+kv_int4.install()
 # Prefill sparse attention: "xpu" (sparse_prefill_xpu.py: each KV row gathered
 # once for K and V, all heads of a token in one program) or "vllm" (the generic
 # triton_bf16_mla_sparse_interface).
@@ -159,6 +161,9 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
             super().__init__(*args, **kwargs)
         finally:
             torch.cuda.Event = orig  # type: ignore[misc]
+        if kv_int4.ENABLED:
+            # INT4 compressed-cache record (kv_int4.py); the SWA cache keeps fp8_ds_mla.
+            self.compressed_bytes_per_token = kv_int4.RECORD
         self._wo_a_bf16: torch.Tensor | None = None
         self._wo_a_sf: torch.Tensor | None = None
         if prof.ENABLED:
@@ -326,7 +331,8 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
                     swa_metadata.is_valid_token[:nd],
                 )
             topk_indices = global_indices.view(nd, 1, -1)
-        if nd <= _FUSED_DECODE_MAX_TOKENS:
+        # The generic decode path below only reads the fp8_ds_mla record.
+        if nd <= _FUSED_DECODE_MAX_TOKENS or kv_int4.is_int4_cache(kv_cache):
             with prof.section("fused_decode"):
                 self._fused_decode(q, kv_cache, topk_indices, topk_lens, swa_metadata, output)
             return
@@ -385,14 +391,21 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
             _pg.__enter__()
             if not swa_only:
                 bt = attn_metadata.block_table[num_decodes:]
-                dequantize_and_gather_k_cache(
-                    kvbuf[:n], compressed_k_cache,
-                    seq_lens=seq_lens[c0:c1] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=bt[c0:c1],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
-                )
+                if kv_int4.is_int4_cache(compressed_k_cache):
+                    kv_int4.gather(
+                        kvbuf[:n], compressed_k_cache,
+                        seq_lens[c0:c1] // self.compress_ratio, bt[c0:c1],
+                        attn_metadata.block_size // self.compress_ratio, max_len=cN,
+                    )
+                else:
+                    dequantize_and_gather_k_cache(
+                        kvbuf[:n], compressed_k_cache,
+                        seq_lens=seq_lens[c0:c1] // self.compress_ratio,
+                        gather_lens=None,
+                        block_table=bt[c0:c1],
+                        block_size=attn_metadata.block_size // self.compress_ratio,
+                        offset=0,
+                    )
             sbt = swa_metadata.block_table[num_decodes:]
             dequantize_and_gather_k_cache(
                 kvbuf[:n], swa_k_cache,

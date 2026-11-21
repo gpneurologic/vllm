@@ -20,6 +20,13 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    from .kv_int4 import RECORD as _I4_RECORD
+    from .kv_int4 import load_kv_i4
+except ImportError:  # loaded by path in kernel tests
+    from kv_int4 import RECORD as _I4_RECORD
+    from kv_int4 import load_kv_i4
+
 LOG2E = 1.4426950408889634
 
 
@@ -48,7 +55,8 @@ def _decode_kernel(q_ptr, ckv_ptr, skv_ptr, topk_ptr, tlen_ptr, swa_ptr, slen_pt
                    sq_t, sq_h, H, max_topk, max_swa, c_bs, c_stride, s_bs, s_stride,
                    sm_scale_log2,
                    HAS_TOPK: tl.constexpr, BH: tl.constexpr, BK: tl.constexpr,
-                   KEYS_PER: tl.constexpr, NSPLIT: tl.constexpr):
+                   KEYS_PER: tl.constexpr, NSPLIT: tl.constexpr,
+                   C_INT4: tl.constexpr = False):
     t = tl.program_id(0)
     hb = tl.program_id(1)
     sp = tl.program_id(2)
@@ -75,8 +83,11 @@ def _decode_kernel(q_ptr, ckv_ptr, skv_ptr, topk_ptr, tlen_ptr, swa_ptr, slen_pt
         si = tl.load(swa_ptr + t * max_swa + u, mask=in_s, other=-1)
         ok_c = in_c & (ci >= 0)
         ok_s = in_s & (si >= 0)
-        kv = _load_kv(ckv_ptr, ci, ok_c, c_bs, c_stride, d) + \
-            _load_kv(skv_ptr, si, ok_s, s_bs, s_stride, d)
+        if C_INT4:
+            kv_c = load_kv_i4(ckv_ptr, ci, ok_c, c_bs, c_stride, d)
+        else:
+            kv_c = _load_kv(ckv_ptr, ci, ok_c, c_bs, c_stride, d)
+        kv = kv_c + _load_kv(skv_ptr, si, ok_s, s_bs, s_stride, d)
         kvb = kv.to(tl.bfloat16)
         s = tl.dot(q, tl.trans(kvb)) * sm_scale_log2  # [BH, BK]
         valid = ok_c | ok_s
@@ -146,6 +157,7 @@ def sparse_decode_fused(q, kv_cache, swa_kv_cache, topk_indices, topk_lens, swa_
         q.stride(0), q.stride(1), H, max_topk, max_swa, c_bs, c_stride,
         swa_kv_cache.shape[1], swa_kv_cache.stride(0), softmax_scale * LOG2E,
         HAS_TOPK=has_topk, BH=bh, BK=bk, KEYS_PER=keys_per, NSPLIT=nsplit,
+        C_INT4=bool(has_topk and ckv.shape[-1] == _I4_RECORD),
         num_warps=num_warps,
     )
     _combine_kernel[(T, H)](acc, ml, attn_sink, out, out.stride(0), out.stride(1), H,
