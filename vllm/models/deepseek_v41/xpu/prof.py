@@ -29,6 +29,7 @@ logger = init_logger(__name__)
 ENABLED = os.environ.get("VLLM_DS41_PROF") == "1"
 _COUNT_OPS = ENABLED and os.environ.get("VLLM_DS41_PROF_OPS") == "1"
 _PREFILL = os.environ.get("VLLM_DS41_PROF_PREFILL") == "1"
+_ALL_RANKS = os.environ.get("VLLM_DS41_PROF_ALL_RANKS") == "1"
 _MIN_TOKENS = int(os.environ.get("VLLM_DS41_PROF_MIN_TOKENS", "256"))
 _EVERY = int(os.environ.get("VLLM_DS41_PROF_EVERY", "5" if _PREFILL else "50"))
 # steps not counted at the start (first calls compile Triton kernels)
@@ -77,15 +78,16 @@ def end_step() -> None:
     if n % _EVERY == 0:
         from vllm.distributed import get_tensor_model_parallel_rank
 
-        if get_tensor_model_parallel_rank() == 0:
+        rank = get_tensor_model_parallel_rank()
+        if rank == 0 or _ALL_RANKS:
             step = _state["step_total"] / n * 1e3
             top = {k: v for k, v in _tot.items() if "/" not in k}
             parts = ", ".join(f"{k} {v / n * 1e3:.1f}" for k, v in
                               sorted(_tot.items(), key=lambda kv: -kv[1]))
             covered = sum(top.values()) / n * 1e3
             kind = "prefill" if _PREFILL else "decode"
-            logger.info("DS41PROF %d %s steps (%.0f tokens/step, %.1f tok/s): %.1f ms/step; "
-                        "per step (ms): %s; other %.1f", n, kind, _state["tokens"] / n,
+            logger.info("DS41PROF rank %d: %d %s steps (%.0f tokens/step, %.1f tok/s): %.1f ms/step; "
+                        "per step (ms): %s; other %.1f", rank, n, kind, _state["tokens"] / n,
                         _state["tokens"] / _state["step_total"], step, parts,
                         step - covered)
             if _ops:

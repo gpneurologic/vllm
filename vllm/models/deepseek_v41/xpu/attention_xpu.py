@@ -44,6 +44,7 @@ from .fp8_gemv import fp8_grouped_gemv
 from .kv_int4_sim import install as _install_kv_int4_sim, int4_roundtrip_
 from .rope_xpu import gptj_rope_, inv_rope_fp8_round
 from .sparse_decode_xpu import sparse_decode_fused
+from .sparse_prefill_xpu import sparse_prefill_attn
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -128,6 +129,10 @@ def _act_fp8_quant(x: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torc
 _WO_A_BMM = __import__("os").environ.get("VLLM_DS41_WO_A_BMM") == "1"
 _TRITON_ROPE = __import__("os").environ.get("VLLM_DS41_TRITON_ROPE", "1") == "1"
 _install_kv_int4_sim()
+# Prefill sparse attention: "xpu" (sparse_prefill_xpu.py: each KV row gathered
+# once for K and V, all heads of a token in one program) or "vllm" (the generic
+# triton_bf16_mla_sparse_interface).
+_SPARSE_PREFILL = __import__("os").environ.get("VLLM_DS41_SPARSE_PREFILL", "xpu")
 _FUSED_DECODE_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_FUSED_DECODE_MAX_TOKENS", "16"))
 _WO_A_GEMV_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_WO_A_GEMV_MAX_TOKENS", "16"))
 
@@ -420,16 +425,21 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
             _pc.__exit__(None, None, None)
             _pa = prof.section("pf_attn")
             _pa.__enter__()
-            out, _, _ = triton_bf16_mla_sparse_interface(
-                q=q[qs:qe],
-                kv=kvbuf[:n].reshape(-1, 1, q.shape[-1]),
-                indices=ci.unsqueeze(1),
-                sm_scale=self.scale,
-                d_v=q.shape[-1],
-                block_dpe=0,
-                attn_sink=self.attn_sink,
-            )
-            output[qs:qe] = out
+            if _SPARSE_PREFILL == "xpu":
+                output[qs:qe] = sparse_prefill_attn(
+                    q[qs:qe], kvbuf[:n].reshape(-1, q.shape[-1]), ci, self.scale,
+                    self.attn_sink)
+            else:
+                out, _, _ = triton_bf16_mla_sparse_interface(
+                    q=q[qs:qe],
+                    kv=kvbuf[:n].reshape(-1, 1, q.shape[-1]),
+                    indices=ci.unsqueeze(1),
+                    sm_scale=self.scale,
+                    d_v=q.shape[-1],
+                    block_dpe=0,
+                    attn_sink=self.attn_sink,
+                )
+                output[qs:qe] = out
             _pa.__exit__(None, None, None)
 
 
