@@ -376,6 +376,8 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
                 ((self.max_num_batched_tokens, combined_topk), torch.int32),
                 ((self.max_num_batched_tokens,), torch.int32),
             )
+            _pg = prof.section("pf_gather")
+            _pg.__enter__()
             if not swa_only:
                 bt = attn_metadata.block_table[num_decodes:]
                 dequantize_and_gather_k_cache(
@@ -395,6 +397,9 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
                 block_size=swa_metadata.block_size,
                 offset=cN,
             )
+            _pg.__exit__(None, None, None)
+            _pc = prof.section("pf_topk_combine")
+            _pc.__enter__()
             qs = qsl_cpu[num_decodes + c0] - base
             qe = qsl_cpu[num_decodes + c1] - base
             ci, cl = combine_topk_swa_indices(
@@ -412,6 +417,9 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
             # Pad positions past each row's length with -1 for the triton kernel.
             ar = torch.arange(ci.shape[-1], device=ci.device)
             ci = torch.where(ar[None, :] < cl[:, None], ci, -1)
+            _pc.__exit__(None, None, None)
+            _pa = prof.section("pf_attn")
+            _pa.__enter__()
             out, _, _ = triton_bf16_mla_sparse_interface(
                 q=q[qs:qe],
                 kv=kvbuf[:n].reshape(-1, 1, q.shape[-1]),
@@ -422,6 +430,7 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
             )
             output[qs:qe] = out
+            _pa.__exit__(None, None, None)
 
 
 def cdiv_(a: int, b: int) -> int:

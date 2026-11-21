@@ -8,7 +8,11 @@ the path ("attention/o_proj"). With VLLM_DS41_PROF_OPS=1 a torch dispatch
 mode also counts the torch ops each section runs (innermost section).
 Rank 0 logs a summary every VLLM_DS41_PROF_EVERY decode steps (default 50).
 The first VLLM_DS41_PROF_SKIP (20) decode steps are not counted: they
-compile Triton kernels. Eager mode only (the syncs cannot be captured)."""
+compile Triton kernels. Eager mode only (the syncs cannot be captured).
+
+VLLM_DS41_PROF_PREFILL=1 times prefill steps (>= VLLM_DS41_PROF_MIN_TOKENS, 256) instead; the first
+VLLM_DS41_PROF_SKIP steps (default 2 in this mode) are skipped, and a summary
+is logged every VLLM_DS41_PROF_EVERY steps (default 5)."""
 from __future__ import annotations
 
 import os
@@ -24,9 +28,11 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 ENABLED = os.environ.get("VLLM_DS41_PROF") == "1"
 _COUNT_OPS = ENABLED and os.environ.get("VLLM_DS41_PROF_OPS") == "1"
-_EVERY = int(os.environ.get("VLLM_DS41_PROF_EVERY", "50"))
-# decode steps not counted at the start (first calls compile Triton kernels)
-_SKIP = int(os.environ.get("VLLM_DS41_PROF_SKIP", "20"))
+_PREFILL = os.environ.get("VLLM_DS41_PROF_PREFILL") == "1"
+_MIN_TOKENS = int(os.environ.get("VLLM_DS41_PROF_MIN_TOKENS", "256"))
+_EVERY = int(os.environ.get("VLLM_DS41_PROF_EVERY", "5" if _PREFILL else "50"))
+# steps not counted at the start (first calls compile Triton kernels)
+_SKIP = int(os.environ.get("VLLM_DS41_PROF_SKIP", "2" if _PREFILL else "20"))
 _tot: dict[str, float] = defaultdict(float)
 _ops: dict[str, int] = defaultdict(int)
 _stack: list[str] = []
@@ -43,7 +49,9 @@ def begin_step(num_tokens: int) -> None:
     """Called at the start of the model forward."""
     if not ENABLED:
         return
-    _state["active"] = num_tokens == 1 and not torch.xpu.is_current_stream_capturing()
+    want = num_tokens >= _MIN_TOKENS if _PREFILL else num_tokens == 1
+    _state["active"] = want and not torch.xpu.is_current_stream_capturing()
+    _state["ntok"] = num_tokens
     if _state["active"] and _state.get("seen", 0) < _SKIP:
         _state["seen"] = _state.get("seen", 0) + 1
         _state["active"] = False
@@ -64,6 +72,7 @@ def end_step() -> None:
     torch.accelerator.synchronize()
     _state["step_total"] += time.perf_counter() - _state["t0"]
     _state["steps"] += 1
+    _state["tokens"] = _state.get("tokens", 0) + _state.get("ntok", 1)
     n = _state["steps"]
     if n % _EVERY == 0:
         from vllm.distributed import get_tensor_model_parallel_rank
@@ -74,8 +83,11 @@ def end_step() -> None:
             parts = ", ".join(f"{k} {v / n * 1e3:.1f}" for k, v in
                               sorted(_tot.items(), key=lambda kv: -kv[1]))
             covered = sum(top.values()) / n * 1e3
-            logger.info("DS41PROF %d decode steps: %.1f ms/step; per step (ms): %s; "
-                        "other %.1f", n, step, parts, step - covered)
+            kind = "prefill" if _PREFILL else "decode"
+            logger.info("DS41PROF %d %s steps (%.0f tokens/step, %.1f tok/s): %.1f ms/step; "
+                        "per step (ms): %s; other %.1f", n, kind, _state["tokens"] / n,
+                        _state["tokens"] / _state["step_total"], step, parts,
+                        step - covered)
             if _ops:
                 tot_ops = sum(_ops.values()) / n
                 parts = ", ".join(f"{k} {v / n:.0f}" for k, v in

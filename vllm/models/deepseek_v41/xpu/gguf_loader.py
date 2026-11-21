@@ -272,6 +272,11 @@ def load_expert_slice(ck: GGUFCheckpoint, layer: int, e_start: int, n: int,
 _DECODE_MAX_PAIRS = int(os.environ.get("VLLM_DS41_DECODE_MAX_PAIRS", "64"))
 
 
+# Prefill expert GEMM: "mmq" (tl.dot kernel in gguf_moe_prefill.py, checked
+# against the plugin kernel once per type) or "plugin" (the plugin's kernel).
+_MOE_PREFILL = os.environ.get("VLLM_DS41_MOE_PREFILL", "mmq")
+
+
 def run_gguf_experts(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
     """Add the local experts' outputs to out (float32 [T, H]) in place."""
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
@@ -282,27 +287,50 @@ def run_gguf_experts(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
         kernels()  # registers the plugin package (IQ tables)
         moe_decode(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit)
         return
+    from . import prof
+    from .gguf_moe_prefill import BLOCK_M as MMQ_BLOCK_M
+    from .gguf_moe_prefill import gguf_moe_mmq, mmq_ok
+
     _, moe, block_m = kernels()
+    _ps = prof.section("moe_sort")
+    _ps.__enter__()
     local = (idx >= e_start) & (idx < e_start + n_local)
     tok, slot = local.nonzero(as_tuple=True)
     if tok.numel() == 0:
+        _ps.__exit__(None, None, None)
         return
     eid = (idx[tok, slot] - e_start).to(torch.int32).view(-1, 1)
     xs = x[tok].contiguous()
     I2, H = w13.shape[1], w2.shape[1]
-    bm = block_m(t13)
+    P = xs.shape[0]
+    mm13 = _MOE_PREFILL == "mmq" and mmq_ok(w13, t13)
+    mm2 = _MOE_PREFILL == "mmq" and mmq_ok(w2, t2)
+    bm = MMQ_BLOCK_M if mm13 else block_m(t13)
     s, e, n = moe_align_block_size(eid, bm, n_local)
-    h = moe(xs, w13, s, e, n, t13, I2, 1, xs.shape[0])
+    _ps.__exit__(None, None, None)
+    with prof.section("moe_w13"):
+        if mm13:
+            h = gguf_moe_mmq(xs, w13, t13, s, e, n, MMQ_BLOCK_M, P)
+        else:
+            h = moe(xs, w13, s, e, n, t13, I2, 1, P)
+    _pa = prof.section("moe_act")
+    _pa.__enter__()
     gate, up = h.float().chunk(2, dim=-1)
     if limit:
         gate = gate.clamp(max=limit)
         up = up.clamp(-limit, limit)
     a = (torch.nn.functional.silu(gate) * up).to(x.dtype)
-    bm2 = block_m(t2)
+    _pa.__exit__(None, None, None)
+    bm2 = MMQ_BLOCK_M if mm2 else block_m(t2)
     if bm2 != bm:
         s, e, n = moe_align_block_size(eid, bm2, n_local)
-    y = moe(a, w2, s, e, n, t2, H, 1, a.shape[0])
-    out.index_add_(0, tok, y.float() * w[tok, slot, None].float())
+    with prof.section("moe_w2"):
+        if mm2:
+            y = gguf_moe_mmq(a, w2, t2, s, e, n, MMQ_BLOCK_M, P)
+        else:
+            y = moe(a, w2, s, e, n, t2, H, 1, P)
+    with prof.section("moe_combine"):
+        out.index_add_(0, tok, y.float() * w[tok, slot, None].float())
 
 
 # ------------------------------------------------------------------- Engram
