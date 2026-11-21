@@ -292,7 +292,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             aux_stream_list=None,
             candidate_block_buffer=candidate_block_buffer,
         )
-        self.ffn = XpuOffloadMoE(vllm_config, prefix=f"{prefix}.ffn")
+        if extract_layer_index(prefix) >= config.num_hidden_layers:
+            # DSpark draft layer (mtp.*): resident MXFP4 experts.
+            from .dspark_moe import XpuDSparkMoE
+
+            self.ffn = XpuDSparkMoE(vllm_config, prefix=f"{prefix}.ffn")
+        else:
+            self.ffn = XpuOffloadMoE(vllm_config, prefix=f"{prefix}.ffn")
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.hc_mult = config.hc_mult
@@ -497,6 +503,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if dbg:
             logger.info("DS41DBG forward layers %d-%d tokens %d", self.start_layer,
                         self.end_layer - 1, positions.shape[0])
+        aux_hidden_states: list[torch.Tensor] = []
         for idx in range(self.start_layer, self.end_layer):
             ran = True
             if dbg:
@@ -506,6 +513,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states, positions, input_ids, pre_mix, post_mix, res_mix,
                 residual, engram_hashes, engram_mask,
             )
+            if idx + 1 in self.aux_hidden_state_layers:
+                # Draft (DSpark) input: the layer's mHC-merged state, hc copies averaged.
+                aux_hidden_states.append(
+                    self.mhc_post(hidden_states, residual, post_mix, res_mix).mean(dim=1))
         if ran:
             with prof.section("mhc"):
                 hidden_states = self.mhc_post(hidden_states, residual, post_mix, res_mix)
@@ -517,6 +528,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         hidden_states = torch.ops.vllm.hc_collapse_triton(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         prof.end_step()
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

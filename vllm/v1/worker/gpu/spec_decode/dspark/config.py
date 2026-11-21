@@ -76,6 +76,13 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
                 "DSparkV41DraftModel" if is_v41 else "DSparkDraftModel"
             ]
             draft.quantization = target.quantization
+            # VLLM_PAD_FOR_TP: the target's config was padded (e.g. 64 -> 66
+            # heads at TP=3) while it was still "deepseek_v41"; the draft's ran
+            # as "deepseek_mtp" and was not. Pad it the same way.
+            from vllm.transformers_utils.tp_pad import maybe_pad_config
+
+            maybe_pad_config(draft.hf_config, draft.hf_text_config)
+            draft.model_arch_config = draft.get_model_arch_config()
             spec.update_arch_()
         elif (
             "MistralLarge4DSparkModel" in draft.architectures

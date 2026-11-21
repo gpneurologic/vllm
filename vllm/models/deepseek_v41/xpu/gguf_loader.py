@@ -231,6 +231,18 @@ class DeepseekV41GGUFLoader(DefaultModelLoader):
 
     def _get_all_weights(self, model_config, model) -> Generator[tuple[str, torch.Tensor], None, None]:
         self.counter_before_loading_weights = time.perf_counter()
+        if hasattr(model, "get_draft_kv_cache_layer_names"):
+            # DSpark draft: its mtp.* weights come from the original checkpoint.
+            oc = _orig_checkpoint()
+            if oc is None:
+                raise ValueError("the DSpark draft needs VLLM_DS41_ORIG_CKPT")
+            for name in oc.index:
+                if name.startswith("mtp."):
+                    t = oc.tensor(name)
+                    if name.endswith(".scale") and t.element_size() == 1:
+                        t = t.view(torch.float8_e8m0fnu)
+                    yield name, t
+            return
         yield from gguf_weights(checkpoint(), _device())
 
     def load_weights(self, model: nn.Module, model_config) -> None:
