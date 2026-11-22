@@ -101,6 +101,11 @@ def _gate_kernel(part_ptr, scale_ptr, base_ptr, res_ptr, prev_ptr,
     tl.store(out_ptr + t * H + offs, out.to(out_ptr.dtype.element_ty), mask=m)
 
 
+# From this many tokens the mix is one fp32 matmul [T, D] x [D, NMIX] (the split-K
+# GEMV kernel re-reads fn, ~1.5 MB, for every token).
+_MATMUL_MIN_T = int(__import__("os").environ.get("VLLM_DS41_MHC_MATMUL_MIN_T", "32"))
+
+
 def mhc_pre_delayed_triton(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
                            hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
                            pre_mix=None, x=None, block_d: int = 1024, block_h: int = 1024):
@@ -111,7 +116,8 @@ def mhc_pre_delayed_triton(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
     NMIX = fn.shape[0]
     assert fn.shape[1] == D and NMIX == 2 * HC + HC * HC, (fn.shape, D)
     NMIX_P = triton.next_power_of_2(NMIX + 1)
-    n_split = triton.cdiv(D, block_d)
+    use_mm = T >= _MATMUL_MIN_T
+    n_split = 1 if use_mm else triton.cdiv(D, block_d)
     dev = residual.device
     part = torch.empty(T, n_split, NMIX_P, dtype=torch.float32, device=dev)
     post = torch.empty(T, HC, 1, dtype=torch.float32, device=dev)
@@ -122,8 +128,14 @@ def mhc_pre_delayed_triton(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
         return post, comb, out, pre
     fn = fn.contiguous()
     res = residual.contiguous()
-    _mix_kernel[(T, n_split)](src, fn, part, D, n_split,
-                              NMIX=NMIX, NMIX_P=NMIX_P, BLOCK_D=block_d)
+    if use_mm:
+        p0 = part[:, 0]
+        torch.matmul(src.float(), fn.t(), out=p0[:, :NMIX])
+        p0[:, NMIX] = torch.linalg.vector_norm(src, dim=-1, dtype=torch.float32).square()
+        p0[:, NMIX + 1:] = 0
+    else:
+        _mix_kernel[(T, n_split)](src, fn, part, D, n_split,
+                                  NMIX=NMIX, NMIX_P=NMIX_P, BLOCK_D=block_d)
     prev = pre_mix.float().contiguous() if pre_mix is not None else pre
     _gate_kernel[(T, triton.cdiv(H, block_h))](
         part, hc_scale, hc_base, res, prev, post, comb, pre, out,
@@ -135,13 +147,13 @@ def mhc_pre_delayed_triton(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
     return post, comb, out, pre
 
 
-_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_MHC_TRITON_MAX_TOKENS", "64"))
+_MAX_TOKENS = int(__import__("os").environ.get("VLLM_DS41_MHC_TRITON_MAX_TOKENS", "1000000"))
 
 
 class XpuMHCPreDelayed(torch.nn.Module):
     """Drop-in for `MHCPreDelayedOp` (same call signature and outputs): the
-    Triton path up to `_MAX_TOKENS` tokens (decode), the original op above
-    (prefill, where the torch reference is faster)."""
+    Triton path (prefill too since the mix became a matmul for many tokens),
+    the original op above `_MAX_TOKENS` or with a fused norm."""
 
     def __init__(self) -> None:
         super().__init__()

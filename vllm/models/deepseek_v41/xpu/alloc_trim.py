@@ -41,4 +41,7 @@ def maybe_trim(num_tokens: int) -> None:
     unused = torch.xpu.memory_reserved() - torch.xpu.memory_allocated()
     if (_LIMIT > 0 and unused > _LIMIT) or (
             unused > _MIN_UNUSED and torch.xpu.mem_get_info()[0] < _LOW_FREE):
+        # Finish queued work first: an asynchronous copy still reading a cached
+        # block that empty_cache hands back to the driver faults on the copy engine.
+        torch.xpu.synchronize()
         torch.xpu.empty_cache()
