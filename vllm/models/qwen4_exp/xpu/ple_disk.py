@@ -16,7 +16,9 @@ import glob
 import json
 import os
 import struct
+from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -24,6 +26,15 @@ from vllm.logger import init_logger
 from ..common.ngram_embedding import Qwen4ExpPLEDeviceEmbedding
 
 logger = init_logger(__name__)
+
+# Rows of a step are read by this many threads (os.preadv releases the GIL).
+# A new prompt reads thousands of rows that are mostly not in the page cache,
+# so serial reads wait on the disk one row at a time. 1 = serial reads.
+_READ_THREADS = int(os.environ.get("VLLM_QWEN4_EXP_PLE_THREADS", "32"))
+# Steps with fewer read runs than this stay serial (decode: a few dozen rows).
+_PARALLEL_MIN_RUNS = int(os.environ.get("VLLM_QWEN4_EXP_PLE_PARALLEL_MIN", "64"))
+# "random" disables kernel read-ahead on the table files (rows are scattered).
+_FADVISE = os.environ.get("VLLM_QWEN4_EXP_PLE_FADVISE", "")
 
 _SAFETENSORS_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
@@ -82,32 +93,69 @@ class PLETableFiles:
                 raise ValueError(f"PLE table in {table_dir} has uneven shards")
             if path not in fds:
                 fds[path] = os.open(path, os.O_RDONLY)
+                if _FADVISE == "random":
+                    os.posix_fadvise(fds[path], 0, 0, os.POSIX_FADV_RANDOM)
             self._fds.append(fds[path])
             self._bases.append(offset)
         if self.dtype == torch.float8_e4m3fn and scale is None:
             raise ValueError(f"FP8 PLE table in {table_dir} has no weight_scale")
         self.scale = 1.0 if scale is None else scale
+        self._pool: ThreadPoolExecutor | None = None
         logger.info(
-            "PLE table on disk: %s, %d rows x %d, %s, %d shards, scale %.6g",
+            "PLE table on disk: %s, %d rows x %d, %s, %d shards, scale %.6g, "
+            "%d read threads",
             table_dir,
             self.num_rows,
             row_dim,
             self.dtype,
             len(shards),
             self.scale,
+            _READ_THREADS,
         )
 
     def read(self, ids: torch.Tensor) -> torch.Tensor:
-        """Return the raw bytes of the rows `ids` (CPU int64) as [n, row_bytes]."""
-        out = torch.empty(ids.numel(), self.row_bytes, dtype=torch.uint8)
+        """Return the raw bytes of the rows `ids` (CPU int64) as [n, row_bytes].
+
+        Consecutive ids in one shard are read with a single call; when a step
+        has many such runs they are spread over a thread pool."""
+        n = ids.numel()
+        out = torch.empty(n, self.row_bytes, dtype=torch.uint8)
+        if n == 0:
+            return out
         rows = out.numpy()
-        shard = torch.div(ids, self.shard_size, rounding_mode="floor")
-        local = ids - shard * self.shard_size
+        idx = ids.numpy()
+        shard = idx // self.shard_size
+        local = idx - shard * self.shard_size
+        new_run = np.ones(n, dtype=bool)
+        new_run[1:] = (shard[1:] != shard[:-1]) | (local[1:] != local[:-1] + 1)
+        starts = np.flatnonzero(new_run)
+        ends = np.append(starts[1:], n)
         row_bytes = self.row_bytes
-        for i, (s, pos) in enumerate(zip(shard.tolist(), local.tolist())):
-            offset = self._bases[s] + pos * row_bytes
-            if os.preadv(self._fds[s], [rows[i]], offset) != row_bytes:
-                raise ValueError(f"PLE table shard {s} is truncated at row {pos}")
+        fds, bases = self._fds, self._bases
+
+        def read_runs(first: int, last: int) -> None:
+            for r in range(first, last):
+                a, b = int(starts[r]), int(ends[r])
+                s = int(shard[a])
+                pos = int(local[a])
+                buf = rows[a:b].reshape(-1)
+                if os.preadv(fds[s], [buf], bases[s] + pos * row_bytes) != buf.size:
+                    raise ValueError(f"PLE table shard {s} is truncated at row {pos}")
+
+        num_runs = len(starts)
+        if _READ_THREADS <= 1 or num_runs < _PARALLEL_MIN_RUNS:
+            read_runs(0, num_runs)
+            return out
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(_READ_THREADS, thread_name_prefix="ple-read")
+        parts = min(num_runs // 16, _READ_THREADS * 4)
+        bounds = np.linspace(0, num_runs, parts + 1, dtype=np.int64)
+        futures = [
+            self._pool.submit(read_runs, int(bounds[i]), int(bounds[i + 1]))
+            for i in range(parts)
+        ]
+        for f in futures:
+            f.result()
         return out
 
 
