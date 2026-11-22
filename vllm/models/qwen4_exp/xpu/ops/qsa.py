@@ -15,11 +15,17 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+# Launch profile override for the split-K sparse attention (see below).
+SPLITK_PROFILE = None
 # Skip the scoring work of programs past the visible context (output identical).
 _SCORE_SKIP_INVISIBLE = os.environ.get("VLLM_QWEN4_QSA_SCORE_SKIP", "1") == "1"
 
 
-@triton.jit
+# Row and request counts change every step. Specializing on them (value 1, or a
+# multiple of 16) builds a new kernel variant, and loading a new variant of
+# the split-K kernel stalls the engine ~40 s on XPU, so they are not
+# specialized (as in the NVIDIA copy of these kernels).
+@triton.jit(do_not_specialize=["num_rows", "num_requests"])
 def _qsa_mqa_paged_kernel(
     q_ptr,
     k_cache_ptr,
@@ -124,7 +130,7 @@ def _qsa_mqa_paged_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "num_requests"])
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,
@@ -195,7 +201,7 @@ def _expand_qsa_indices_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "num_requests"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -373,7 +379,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
@@ -417,7 +423,7 @@ def _qsa_merge_splitk_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _store_qsa_rows_kernel(
     cache_ptr,
     slots_ptr,
@@ -454,7 +460,7 @@ def _store_qsa_rows_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "num_requests"])
 def _compress_qsa_groups_kernel(
     raw_keys_ptr,  # this step's raw key rows, straight from activations
     raw_positions_ptr,  # this step's per-token positions
@@ -906,6 +912,12 @@ def qsa_sparse_paged_attention(
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
     partial_stages = 1 if current_platform.is_rocm() else 2
+    # XPU: a profile picked by a launch sweep on the B70 replaces the GB300
+    # one above (callable: rows, kv_heads, group -> (block_n, splits, warps, stages)).
+    if SPLITK_PROFILE is not None:
+        block_n, target_splits, partial_warps, partial_stages = SPLITK_PROFILE(
+            q.shape[0], k_cache.shape[2], group_size
+        )
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
