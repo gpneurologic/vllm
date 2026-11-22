@@ -287,6 +287,9 @@ _DECODE_MAX_PAIRS = int(os.environ.get("VLLM_DS41_DECODE_MAX_PAIRS", "64"))
 # Prefill expert GEMM: "mmq" (tl.dot kernel in gguf_moe_prefill.py, checked
 # against the plugin kernel once per type) or "plugin" (the plugin's kernel).
 _MOE_PREFILL = os.environ.get("VLLM_DS41_MOE_PREFILL", "mmq")
+# int8 activations x int8 weights on XMX for the IQ2_XXS expert matrices (~1.4x
+# faster than the bf16 kernel; per-32 activation quantization as llama.cpp MMQ)
+_MOE_I8 = os.environ.get("VLLM_DS41_MOE_I8", "1") == "1"
 
 
 def run_gguf_experts(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
@@ -301,7 +304,8 @@ def run_gguf_experts(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
         return
     from . import prof
     from .gguf_moe_prefill import BLOCK_M as MMQ_BLOCK_M
-    from .gguf_moe_prefill import gguf_moe_mmq, mmq_ok
+    from .gguf_moe_prefill import (I8_TYPES, gguf_moe_mmq, gguf_moe_mmq_i8, mmq_ok,
+                                   quantize_rows_i8)
 
     _, moe, block_m = kernels()
     _ps = prof.section("moe_sort")
@@ -317,12 +321,20 @@ def run_gguf_experts(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
     P = xs.shape[0]
     mm13 = _MOE_PREFILL == "mmq" and mmq_ok(w13, t13)
     mm2 = _MOE_PREFILL == "mmq" and mmq_ok(w2, t2)
+    i8_13 = mm13 and _MOE_I8 and t13 in I8_TYPES and mmq_ok(w13, t13, int8=True)
+    i8_2 = mm2 and _MOE_I8 and t2 in I8_TYPES and mmq_ok(w2, t2, int8=True)
     bm = MMQ_BLOCK_M if mm13 else block_m(t13)
     s, e, n = moe_align_block_size(eid, bm, n_local)
     _ps.__exit__(None, None, None)
     with prof.section("moe_w13"):
         if mm13:
-            h = gguf_moe_mmq(xs, w13, t13, s, e, n, MMQ_BLOCK_M, P)
+            if i8_13:
+                # quantize each token once, then pick its rows for the pairs
+                q, qs = quantize_rows_i8(x)
+                h = gguf_moe_mmq_i8(xs, w13, t13, s, e, n, MMQ_BLOCK_M, P,
+                                    xq=(q[tok].contiguous(), qs[tok].contiguous()))
+            else:
+                h = gguf_moe_mmq(xs, w13, t13, s, e, n, MMQ_BLOCK_M, P)
         else:
             h = moe(xs, w13, s, e, n, t13, I2, 1, P)
     _pa = prof.section("moe_act")
@@ -338,7 +350,8 @@ def run_gguf_experts(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
         s, e, n = moe_align_block_size(eid, bm2, n_local)
     with prof.section("moe_w2"):
         if mm2:
-            y = gguf_moe_mmq(a, w2, t2, s, e, n, MMQ_BLOCK_M, P)
+            mm = gguf_moe_mmq_i8 if i8_2 else gguf_moe_mmq
+            y = mm(a, w2, t2, s, e, n, MMQ_BLOCK_M, P)
         else:
             y = moe(a, w2, s, e, n, t2, H, 1, P)
     with prof.section("moe_combine"):
