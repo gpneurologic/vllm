@@ -126,16 +126,26 @@ def _combine_kernel(acc_ptr, ml_ptr, sink_ptr, out_ptr, so_t, so_h, H,
 
 
 def sparse_decode_fused(q, kv_cache, swa_kv_cache, topk_indices, topk_lens, swa_indices,
-                        swa_lens, attn_sink, softmax_scale, out, nsplit: int = 8,
-                        bh: int = 16, bk: int = 16, num_warps: int = 8) -> None:
+                        swa_lens, attn_sink, softmax_scale, out, nsplit: int | None = None,
+                        bh: int = 16, bk: int | None = None, num_warps: int = 8) -> None:
     """q [T, H, 512]; caches [num_blocks, block_size, 584] uint8 views;
     topk_indices [T, 1, max_topk] or None; swa_indices [T, 1, max_swa];
-    out [T, H, 512]."""
+    out [T, H, 512].
+
+    nsplit / bk default per case (sweep on Arc Pro B70, 22 heads per card): a
+    decode step has only T x 2 head blocks, so the keys are split finely to
+    fill the GPU. Top-k + window layers: 64 splits (1 token: 32-key blocks,
+    85 -> 31 us; 2+ tokens: 16-key blocks, 85 -> 37 us); window-only layers:
+    16 splits (24 -> 17 us)."""
     T, H, D = q.shape
     assert D == 512
     if T == 0:
         return
     has_topk = topk_indices is not None and kv_cache is not None
+    if nsplit is None:
+        nsplit = 64 if has_topk else 16
+    if bk is None:
+        bk = 32 if has_topk and T == 1 else 16
     swa = swa_indices.reshape(T, -1).to(torch.int32).contiguous()
     max_swa = swa.shape[1]
     if has_topk:

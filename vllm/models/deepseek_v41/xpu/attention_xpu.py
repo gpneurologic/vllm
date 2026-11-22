@@ -11,6 +11,7 @@ Built on the shared V4.1 `DeepseekV4Attention`. Differences from CUDA:
   and dequantizes it per call for larger batches.
 """
 
+import os
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -166,6 +167,16 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
             self.compressed_bytes_per_token = kv_int4.RECORD
         self._wo_a_bf16: torch.Tensor | None = None
         self._wo_a_sf: torch.Tensor | None = None
+        _abl = set(filter(None, os.environ.get("VLLM_DS41_ABLATE", "").split(",")))
+        if _abl:  # timing experiments only (wrong outputs), see model.py
+            if "mqa" in _abl:
+                self.forward_mqa = lambda q, kv, positions, output: None
+            if "o_proj" in _abl:
+                self._o_proj = lambda attn_out, positions: torch.zeros(
+                    attn_out.shape[0], self.wo_b.output_size, dtype=torch.bfloat16,
+                    device=attn_out.device)
+            if "compressor" in _abl and getattr(self, "compressor", None) is not None:
+                self.compressor.forward = lambda *a, **k: None
         if prof.ENABLED:
             for meth, name in (("_run_parallel_input_projections", "in_proj"),
                                ("_split_qkv_and_norm", "split_norm"),
