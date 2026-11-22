@@ -61,7 +61,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
 from .attention_xpu import DeepseekV41XPUAttention
-from . import alloc_trim, prof
+from . import alloc_trim, expert_stats, prof
 from .mhc_xpu import XpuMHCPreDelayed
 from .gguf_loader import GgufEngramEmbedding, gguf_path, load_expert_slice, run_gguf_experts
 from .offload import DiskEngramEmbedding, ExpertCache, run_expert
@@ -236,6 +236,7 @@ class XpuOffloadMoE(nn.Module):
         with prof.section("router"):
             w, idx = self._route(x)
             prof.note_experts(idx)
+            expert_stats.add(int(self.prefix_ckpt.split(".")[1]), idx, self.n_routed)
             out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         # The memory-profile / warm-up passes run without attention metadata:
         # skip routed experts there so the expert cache (allocated outside
@@ -462,6 +463,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         None if input_ids is None else tuple(input_ids.shape),
                         None if lookback_token_ids is None else tuple(lookback_token_ids.shape))
         alloc_trim.maybe_trim(positions.shape[0])
+        expert_stats.step()
         prof.begin_step(positions.shape[0])
         if get_pp_group().is_first_rank:
             hidden_states = (

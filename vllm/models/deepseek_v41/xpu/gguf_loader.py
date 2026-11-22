@@ -346,6 +346,34 @@ def run_gguf_experts(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
 
 
 # ------------------------------------------------------------------- Engram
+# Engram rows are random 144-byte reads from a ~110 GB file that does not fit in
+# RAM: one page fault (NVMe read) per row. A single thread waits on each read in
+# turn (~1k rows/s); many threads keep the NVMe queue full (~60k rows/s with 64).
+_ENGRAM_THREADS = int(os.environ.get("VLLM_DS41_ENGRAM_THREADS", "64"))
+_engram_pool = None
+
+
+def _engram_gather(table: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    """table[idx] (rows), gathered by a thread pool when there are many rows."""
+    global _engram_pool
+    n = idx.shape[0]
+    if _ENGRAM_THREADS <= 1 or n < 256:
+        return table[idx]
+    if _engram_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _engram_pool = ThreadPoolExecutor(_ENGRAM_THREADS, thread_name_prefix="ds41-engram")
+    out = np.empty((n, table.shape[1]), dtype=table.dtype)
+    bounds = np.linspace(0, n, min(n // 32, _ENGRAM_THREADS * 4) + 1, dtype=np.int64)
+
+    def part(i):
+        a, b = bounds[i], bounds[i + 1]
+        np.take(table, idx[a:b], axis=0, out=out[a:b])  # releases the GIL
+
+    list(_engram_pool.map(part, range(len(bounds) - 1)))
+    return out
+
+
 class GgufEngramEmbedding(nn.Module):
     """Stands in for ``ParallelEngramEmbedding``: hash columns split over TP
     ranks, IQ4_NL rows read from the GGUF Engram table on every lookup."""
@@ -411,7 +439,7 @@ class GgufEngramEmbedding(nn.Module):
                                int(bad.sum()))
                 self._warned = True
             flat = np.where(bad, 0, flat)
-        raw = torch.from_numpy(self._rows()[flat + self.base]).to(rows.device)
+        raw = torch.from_numpy(_engram_gather(self._rows(), flat + self.base)).to(rows.device)
         v = dequant_iq4_nl(raw, self.dim)
         if bad.any():
             v[torch.from_numpy(bad).to(v.device)] = 0
