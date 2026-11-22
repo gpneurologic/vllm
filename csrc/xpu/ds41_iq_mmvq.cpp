@@ -54,6 +54,10 @@ struct block_iq1_m {
 static_assert(sizeof(block_iq1_m) == 56, "iq1_m block");
 
 // -DDS41_NATIVE_DP4A=0 builds the portable byte-multiply version instead.
+// -DDS41_RAW_TILE=0: decode each row right after loading it (the old order).
+#ifndef DS41_RAW_TILE
+#define DS41_RAW_TILE 1
+#endif
 #ifndef DS41_NATIVE_DP4A
 #define DS41_NATIVE_DP4A 4
 #endif
@@ -301,6 +305,85 @@ inline void unpack_sub(const uint8_t *wrow, int sbk, int ib32, wsub &u, const ui
   }
 }
 
+// Raw bytes of one 32-value sub-block, loaded for every row of a tile before
+// any of them is decoded, so the loads of all rows are in flight together
+// (decoding row by row made each row wait for its own load, then its grid
+// lookups: ~87 GB/s for IQ2_XXS rows).
+template <int QT> struct rawsub;
+template <> struct rawsub<16> { uint16_t q[4]; sycl::half d; };
+template <> struct rawsub<17> { uint16_t q[4]; sycl::half d; uint8_t sc; };
+// IQ1_M as scalars (byte arrays here were kept in private memory).
+template <> struct rawsub<29> { uint32_t qs; uint32_t qh; uint32_t sc_lo, sc_hi; };
+
+template <int QT>
+inline void load_raw(const uint8_t *wrow, int sbk, int ib32, rawsub<QT> &r) {
+  if constexpr (QT == 16) {
+    const block_iq2_xxs *b = reinterpret_cast<const block_iq2_xxs *>(wrow) + sbk;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) r.q[l] = b->qs[4 * ib32 + l];
+    r.d = b->d;
+  } else if constexpr (QT == 17) {
+    const block_iq2_xs *b = reinterpret_cast<const block_iq2_xs *>(wrow) + sbk;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) r.q[l] = b->qs[4 * ib32 + l];
+    r.d = b->d;
+    r.sc = b->scales[ib32];
+  } else {
+    const block_iq1_m *b = reinterpret_cast<const block_iq1_m *>(wrow) + sbk;
+    r.qs = *reinterpret_cast<const uint32_t *>(b->qs + 4 * ib32);  // 4-byte aligned
+    r.qh = *reinterpret_cast<const uint16_t *>(b->qh + 2 * ib32);
+    r.sc_lo = *reinterpret_cast<const uint32_t *>(b->scales);
+    r.sc_hi = *reinterpret_cast<const uint32_t *>(b->scales + 4);
+  }
+}
+
+// Same result as unpack_sub, from the raw bytes.
+template <int QT>
+inline void unpack_raw(const rawsub<QT> &r, int ib32, wsub &u, const uint64_t *grid) {
+  if constexpr (QT == 16) {
+    uint32_t aux32 = r.q[2] | (static_cast<uint32_t>(r.q[3]) << 16);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint32_t a8 = (r.q[l / 2] >> (8 * (l % 2))) & 0xff;
+      const uint64_t g = grid[a8];
+      const uint32_t signs = ksign(aux32 & 127);
+      u.v[2 * l] = apply_signs(static_cast<uint32_t>(g), sign_mask4(signs));
+      u.v[2 * l + 1] = apply_signs(static_cast<uint32_t>(g >> 32), sign_mask4(signs >> 4));
+      aux32 >>= 7;
+    }
+    u.ws[0] = u.ws[1] = static_cast<float>(r.d) * (0.5f + aux32) * 0.25f;
+  } else if constexpr (QT == 17) {
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint64_t g = grid[r.q[l] & 511];
+      const uint32_t signs = ksign(r.q[l] >> 9);
+      u.v[2 * l] = apply_signs(static_cast<uint32_t>(g), sign_mask4(signs));
+      u.v[2 * l + 1] = apply_signs(static_cast<uint32_t>(g >> 32), sign_mask4(signs >> 4));
+    }
+    const float d = static_cast<float>(r.d) * 0.25f;
+    u.ws[0] = d * (0.5f + (r.sc & 0xf));
+    u.ws[1] = d * (0.5f + (r.sc >> 4));
+  } else {
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint32_t qh = r.qh >> (4 * l);
+      const uint32_t g = iq1s_grid_gpu[((r.qs >> (8 * l)) & 0xff) | ((qh & 7) << 8)];
+      u.v[2 * l] = static_cast<int>(g & 0x0f0f0f0f);
+      u.v[2 * l + 1] = static_cast<int>((g >> 4) & 0x0f0f0f0f);
+      u.delta[l] = (qh & 0x08) ? -1.f - IQ1M_DELTA : -1.f + IQ1M_DELTA;
+    }
+    const uint32_t sc[4] = {r.sc_lo & 0xffff, r.sc_lo >> 16, r.sc_hi & 0xffff, r.sc_hi >> 16};
+    const uint16_t s16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) |
+                         (sc[3] & 0xf000);
+    sycl::half hs;
+    std::memcpy(&hs, &s16, 2);
+    const float d = static_cast<float>(hs);
+    const uint32_t sw = ((ib32 < 4 ? r.sc_lo : r.sc_hi) >> (16 * ((ib32 / 2) & 1))) & 0xffff;
+    u.ws[0] = d * (2 * ((sw >> (6 * (ib32 % 2))) & 0x7) + 1);
+    u.ws[1] = d * (2 * ((sw >> (6 * (ib32 % 2) + 3)) & 0x7) + 1);
+  }
+}
+
 template <int QT>
 inline float dot_sub(const wsub &u, const block_q8_1 &q8) {
   const int8_t *a = q8.qs;
@@ -437,6 +520,32 @@ void moe_mmvq_rows(sycl::queue &q, const uint8_t *w, int64_t expert_stride, int6
 #pragma unroll
         for (int c = 0; c < MC; ++c) acc[r][c] = 0.f;
       const uint8_t *wbase = w + static_cast<int64_t>(e) * expert_stride + row0 * row_bytes;
+#if DS41_RAW_TILE
+      if constexpr (MC == 1) {
+        if (row0 + R <= N) {  // full tile: no per-row bound checks
+          for (int sub = lane; sub < nsub; sub += SG) {
+            const int sbk = sub >> 3, ib32 = sub & 7;
+            const block_q8_1 qa = xq[static_cast<size_t>(p / xdiv) * nq8 + sub];
+            rawsub<QT> rw[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) load_raw<QT>(wbase + r * row_bytes, sbk, ib32, rw[r]);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+              wsub u;
+              unpack_raw<QT>(rw[r], ib32, u, grid);
+              acc[r][0] += dot_sub<QT>(u, qa);
+            }
+          }
+#pragma unroll
+          for (int r = 0; r < R; ++r) {
+            const float s =
+                sycl::reduce_over_group(it.get_sub_group(), acc[r][0], sycl::plus<float>());
+            if (lane == 0) y[static_cast<size_t>(p) * N + row0 + r] = s;
+          }
+          return;
+        }
+      }
+#endif
       for (int sub = lane; sub < nsub; sub += SG) {
         const int sbk = sub >> 3, ib32 = sub & 7;
         block_q8_1 qa[MC];
