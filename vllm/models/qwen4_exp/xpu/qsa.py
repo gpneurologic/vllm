@@ -55,6 +55,7 @@ from vllm.v1.worker.workspace import (
 
 from ..common.qsa import Qwen4ExpQSAMetadata, Qwen4ExpQSAMetadataBuilder
 from ..common.qsa_indexer import QSAIndexerMetadata, qsa_kv_cache_dtype
+from . import kv_sim as _kv_sim
 from . import model
 from .qsa_indexer import QSAIndexer
 
@@ -257,6 +258,8 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
     ) -> None:
         """Store BF16 K/V directly or use the existing Octave cache writer."""
         if self.octave_fmt is None:
+            if _kv_sim.ENABLED:
+                key, value = _kv_sim.roundtrip(key, value, self.head_size)
             key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_size, dim=-1
             )
@@ -515,6 +518,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             and self.indexer.use_fused_pre_indexer
             and self.head_dim & (self.head_dim - 1) == 0
             and self.kv_cache_dtype not in _OCTAVE_CACHE_DTYPES
+            and not _kv_sim.ENABLED
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.register_buffer(
