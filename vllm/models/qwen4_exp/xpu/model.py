@@ -233,6 +233,37 @@ def _maybe_lm_head_fp8(model: nn.Module) -> None:
         convert_lm_head_fp8(model)
 
 
+def _maybe_hc_fp8(model: nn.Module) -> None:
+    """VLLM_QWEN4_HC_FP8=1: the hyper-connection mix linears in FP8 weight-only
+    (per-row scale, oneDNN fp8_gemm_w8a16). They are replicated on every TP rank
+    and bf16 in the checkpoint: ~1.26 GB read per decode step on every card."""
+    if os.environ.get("VLLM_QWEN4_HC_FP8", "0") != "1":
+        return
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
+        convert_layer_fp8,
+    )
+
+    n = saved = 0
+    for name, mod in model.named_modules():
+        if (
+            "hyper_connection" in name
+            and isinstance(mod, LinearBase)
+            and isinstance(mod.quant_method, UnquantizedLinearMethod)
+            and getattr(mod, "weight", None) is not None
+            and mod.weight.dim() == 2
+            and mod.weight.dtype in (torch.float16, torch.bfloat16)
+        ):
+            saved += convert_layer_fp8(mod)
+            n += 1
+    torch.accelerator.empty_cache()
+    logger.info(
+        "Hyper-connection linears: %d converted to FP8 weight-only (%.0f MiB saved)",
+        n,
+        saved / 2**20,
+    )
+
+
 def _dequantize_gptq_lm_head(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
@@ -1112,6 +1143,7 @@ class Qwen4ExpForCausalLM(
         )
         loaded = loader.load_weights(weights, mapper=mapper)
         _maybe_lm_head_fp8(self)
+        _maybe_hc_fp8(self)
         return loaded
 
 
@@ -1322,6 +1354,7 @@ class Qwen4ExpForConditionalGeneration(
         )
         loaded = loader.load_weights(weights, mapper=mapper)
         _maybe_lm_head_fp8(self)
+        _maybe_hc_fp8(self)
         return loaded
 
     @classmethod
