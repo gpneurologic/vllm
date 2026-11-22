@@ -35,6 +35,30 @@ _READ_THREADS = int(os.environ.get("VLLM_QWEN4_EXP_PLE_THREADS", "32"))
 _PARALLEL_MIN_RUNS = int(os.environ.get("VLLM_QWEN4_EXP_PLE_PARALLEL_MIN", "64"))
 # "random" disables kernel read-ahead on the table files (rows are scattered).
 _FADVISE = os.environ.get("VLLM_QWEN4_EXP_PLE_FADVISE", "")
+# How a step's rows reach the device buffer:
+#   host  - decode FP8 -> bf16 on the CPU, copy bf16 (the original path)
+#   gpu   - copy the raw FP8 bytes through a pinned buffer, decode on the device
+#   split - like gpu, but each TP rank reads only its share of the n-gram heads
+#           and the ranks all-gather the decoded rows (every rank used to read
+#           every row, as DeepSeek's Engram reads did before its column split)
+_STAGE_MODE = os.environ.get("VLLM_QWEN4_EXP_PLE_STAGE", "split")
+# Compare the chosen mode with the host path for this many steps (raises on a
+# mismatch). 0 = off.
+_STAGE_CHECKS = int(os.environ.get("VLLM_QWEN4_EXP_PLE_CHECK", "0"))
+# Quality-only: round every decoded row through symmetric INT4 per group of N
+# values (fp16 scale = amax / 7), as an INT4 copy of the table would store it.
+_SIM_INT4 = int(os.environ.get("VLLM_QWEN4_EXP_PLE_SIM_INT4", "0"))
+
+
+def _sim_int4(rows: torch.Tensor) -> torch.Tensor:
+    """float32 [n, D] -> the same rows after an INT4 round trip."""
+    if not _SIM_INT4:
+        return rows
+    n, d = rows.shape
+    g = rows.view(n, d // _SIM_INT4, _SIM_INT4)
+    s = (g.abs().amax(-1, keepdim=True) / 7.0).clamp_min(1e-12)
+    s = s.to(torch.float16).float()
+    return ((g / s).round().clamp(-7, 7) * s).view(n, d)
 
 _SAFETENSORS_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
@@ -113,13 +137,17 @@ class PLETableFiles:
             _READ_THREADS,
         )
 
-    def read(self, ids: torch.Tensor) -> torch.Tensor:
+    def read(self, ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         """Return the raw bytes of the rows `ids` (CPU int64) as [n, row_bytes].
 
         Consecutive ids in one shard are read with a single call; when a step
-        has many such runs they are spread over a thread pool."""
+        has many such runs they are spread over a thread pool. `out` (CPU
+        uint8, at least [n, row_bytes], e.g. pinned) receives the rows."""
         n = ids.numel()
-        out = torch.empty(n, self.row_bytes, dtype=torch.uint8)
+        if out is None:
+            out = torch.empty(n, self.row_bytes, dtype=torch.uint8)
+        else:
+            out = out[:n]
         if n == 0:
             return out
         rows = out.numpy()
@@ -168,6 +196,30 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEDeviceEmbedding):
         super().__init__(*args, **kwargs)
         self._table = PLETableFiles(table_dir, self.weight.shape[1])
         self._staging: torch.Tensor | None = None
+        self._pinned: torch.Tensor | None = None
+        self._checks_left = _STAGE_CHECKS
+        # split: this rank reads heads [h0, h1); all ranks gather [T, tp*per, D]
+        # and `index` picks the real heads back out of the padded layout.
+        self._split: tuple[int, int, int, torch.Tensor] | None = None
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        tp = get_tensor_model_parallel_world_size()
+        if tp > 1 and _STAGE_MODE == "split":
+            heads = self._num_heads
+            per = -(-heads // tp)
+            rank = get_tensor_model_parallel_rank()
+            h0, h1 = min(rank * per, heads), min((rank + 1) * per, heads)
+            index = torch.tensor(
+                [r * per + j for r in range(tp)
+                 for j in range(min((r + 1) * per, heads) - min(r * per, heads))],
+                dtype=torch.long,
+                device=self.weight.device,
+            )
+            self._split = (h0, h1, per, index)
+            logger.info("PLE rows: rank %d reads heads %d..%d of %d", rank, h0, h1 - 1, heads)
 
     def allocate_embedding_weight(
         self,
@@ -195,16 +247,74 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEDeviceEmbedding):
             )
         if num_tokens == 0:
             return
-        ids = ngram_ids.detach().to("cpu").flatten()
-        unique, inverse = ids.unique(return_inverse=True)
+        ids = ngram_ids.detach().to("cpu")
+        mode = _STAGE_MODE
+        if mode == "split" and self._split is None:
+            mode = "gpu"
+        if mode == "host":
+            self._staging[:num_tokens].copy_(self._decode_host(ids))
+        elif mode == "gpu":
+            self._staging[:num_tokens].copy_(self._decode_gpu(ids))
+        else:
+            h0, h1, per, index = self._split
+            local = self._decode_gpu(ids[:, h0:h1].contiguous())
+            if h1 - h0 < per:
+                pad = local.new_zeros((num_tokens, per - (h1 - h0), local.shape[-1]))
+                local = torch.cat((local, pad), dim=1)
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            full = tensor_model_parallel_all_gather(local, dim=1)
+            torch.index_select(full, 1, index, out=self._staging[:num_tokens])
+        if self._checks_left > 0:
+            self._checks_left -= 1
+            ref = self._decode_host(ids).to(self._staging.device)
+            same = torch.equal(ref, self._staging[:num_tokens])
+            logger.info("PLE stage check (%s, %d tokens): %s", mode, num_tokens,
+                        "identical" if same else "MISMATCH")
+            if not same:
+                raise RuntimeError(f"PLE stage mode {mode} differs from the host path")
+
+    def _unique(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        unique, inverse = ids.flatten().unique(return_inverse=True)
         if int(unique[0]) < 0 or int(unique[-1]) >= self._table.num_rows:
             raise IndexError(f"PLE id out of range for {self._table.num_rows} rows")
+        return unique, inverse
+
+    def _decode_host(self, ids: torch.Tensor) -> torch.Tensor:
+        """Reference path: decode on the host. [T, H] ids -> [T, H, D] rows."""
+        unique, inverse = self._unique(ids)
         raw = self._table.read(unique)
         rows = raw.view(self._table.dtype).to(torch.float32)
         if self._table.scale != 1.0:
             rows = rows * self._table.scale
-        host = rows.index_select(0, inverse).to(self.weight.dtype)
-        self._staging[:num_tokens].copy_(host.view(num_tokens, self._num_heads, -1))
+        rows = _sim_int4(rows)
+        out = rows.index_select(0, inverse).to(self.weight.dtype)
+        return out.view(*ids.shape, -1)
+
+    def _decode_gpu(self, ids: torch.Tensor) -> torch.Tensor:
+        """Raw FP8 rows to the device through a pinned buffer, decoded there.
+        Same float32 math as the host path, so the result is bit-identical."""
+        unique, inverse = self._unique(ids)
+        n = unique.numel()
+        dev = self.weight.device
+        if self._pinned is None or self._pinned.shape[0] < n:
+            self._pinned = torch.empty(
+                (max(n, 2 * (0 if self._pinned is None else self._pinned.shape[0])),
+                 self._table.row_bytes),
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+        raw = self._table.read(unique, out=self._pinned)
+        raw_d = raw.to(dev, non_blocking=True)
+        inv_d = inverse.to(dev, non_blocking=True)
+        rows = raw_d.view(self._table.dtype).to(torch.float32)
+        if self._table.scale != 1.0:
+            rows = rows * self._table.scale
+        rows = _sim_int4(rows)
+        out = rows.index_select(0, inv_d).to(self.weight.dtype)
+        # The pinned buffer is reused next step: wait for the copy to finish.
+        torch.accelerator.synchronize()
+        return out.view(*ids.shape, -1)
 
     def forward(self, ngram_ids: torch.Tensor) -> torch.Tensor:
         if self._staging is None:
