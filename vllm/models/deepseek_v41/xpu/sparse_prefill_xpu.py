@@ -15,11 +15,11 @@ import triton.language as tl
 
 
 @triton.jit
-def _sparse_prefill_kernel(q_ptr, kv_ptr, idx_ptr, sink_ptr, out_ptr,
+def _sparse_prefill_kernel(q_ptr, kv_ptr, idx_ptr, len_ptr, sink_ptr, out_ptr,
                            H, seq_kv, topk, stride_qt, stride_qh, stride_it,
                            stride_ot, stride_oh, sm_scale_log2,
                            D: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
-                           HAS_SINK: tl.constexpr):
+                           HAS_SINK: tl.constexpr, HAS_LEN: tl.constexpr):
     t = tl.program_id(0)
     hb = tl.program_id(1)
     heads = hb * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -30,9 +30,14 @@ def _sparse_prefill_kernel(q_ptr, kv_ptr, idx_ptr, sink_ptr, out_ptr,
     m = tl.zeros([BLOCK_H], dtype=tl.float32) - 1.0e30
     s = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, D], dtype=tl.float32)
-    for n0 in range(0, topk, BLOCK_N):
+    # Valid indices are packed at the front of each row; stop at the row's
+    # length instead of walking the padding (rows are 768 wide, <= 640 used).
+    L = topk
+    if HAS_LEN:
+        L = tl.minimum(tl.load(len_ptr + t), topk)
+    for n0 in range(0, L, BLOCK_N):
         offs = n0 + tl.arange(0, BLOCK_N)
-        ind = tl.load(idx_ptr + t * stride_it + offs, mask=offs < topk, other=-1)
+        ind = tl.load(idx_ptr + t * stride_it + offs, mask=offs < L, other=-1)
         valid = (ind >= 0) & (ind < seq_kv)
         rows = tl.where(valid, ind, 0).to(tl.int64)
         kv = tl.load(kv_ptr + rows[:, None] * D + d[None, :], mask=valid[:, None], other=0.0)
@@ -59,9 +64,14 @@ def _sparse_prefill_kernel(q_ptr, kv_ptr, idx_ptr, sink_ptr, out_ptr,
 def sparse_prefill_attn(q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor,
                         sm_scale: float, attn_sink: torch.Tensor | None,
                         block_h: int = 32, block_n: int = 16,
-                        num_warps: int = 16) -> torch.Tensor:
+                        num_warps: int = 16,
+                        lens: torch.Tensor | None = None) -> torch.Tensor:
     """q [T, H, 512] bf16, kv [M, 512] bf16 rows, indices [T, topk] int32 (-1 =
-    none). Returns bf16 [T, H, 512].
+    none). lens [T] int32 (optional): number of valid indices at the front of
+    each row; the rest are skipped. Returns bf16 [T, H, 512].
+
+    Length-bounded loop at T = 1024, 24 heads: 4.97 -> 4.65 ms with 640 of 768
+    valid, 5.29 -> 2.19 ms with 300 valid (bit-identical output).
 
     Defaults from a sweep on Arc Pro B70 (T = 512, 22 heads): 0.67 ms vs 4.32 ms
     for the generic kernel at topk 128, 2.12 ms vs 16.09 ms at topk 640; 16
@@ -73,10 +83,11 @@ def sparse_prefill_attn(q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor
     kv = kv.reshape(-1, D)
     idx = indices.reshape(T, topk)
     _sparse_prefill_kernel[(T, triton.cdiv(H, block_h))](
-        q, kv, idx, attn_sink if attn_sink is not None else q, out,
+        q, kv, idx, lens if lens is not None else idx,
+        attn_sink if attn_sink is not None else q, out,
         H, kv.shape[0], topk, q.stride(0), q.stride(1), idx.stride(0),
         out.stride(0), out.stride(1), sm_scale * 1.4426950408889634,
         D=D, BLOCK_H=block_h, BLOCK_N=block_n, HAS_SINK=attn_sink is not None,
-        num_warps=num_warps,
+        HAS_LEN=lens is not None, num_warps=num_warps,
     )
     return out

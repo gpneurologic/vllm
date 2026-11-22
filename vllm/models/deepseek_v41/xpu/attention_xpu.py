@@ -444,15 +444,17 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
                 out=(idx_out[: qe - qs], len_out[: qe - qs]),
             )
             # Pad positions past each row's length with -1 for the triton kernel.
-            ar = torch.arange(ci.shape[-1], device=ci.device)
-            ci = torch.where(ar[None, :] < cl[:, None], ci, -1)
+            # (The XPU kernel takes the lengths and needs no padding.)
+            if _SPARSE_PREFILL != "xpu":
+                ar = torch.arange(ci.shape[-1], device=ci.device)
+                ci = torch.where(ar[None, :] < cl[:, None], ci, -1)
             _pc.__exit__(None, None, None)
             _pa = prof.section("pf_attn")
             _pa.__enter__()
             if _SPARSE_PREFILL == "xpu":
                 output[qs:qe] = sparse_prefill_attn(
                     q[qs:qe], kvbuf[:n].reshape(-1, q.shape[-1]), ci, self.scale,
-                    self.attn_sink)
+                    self.attn_sink, lens=cl)
             else:
                 out, _, _ = triton_bf16_mla_sparse_interface(
                     q=q[qs:qe],

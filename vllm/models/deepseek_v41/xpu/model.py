@@ -78,6 +78,9 @@ _INT4_WO_A = __import__("os").environ.get("VLLM_DS41_INT4_WO_A", "0") == "1"
 # embedding / LM head: fp8 (32x32 blocks; default), int4 (~1.7% perplexity), bf16
 _VOCAB_FORMAT = __import__("os").environ.get("VLLM_DS41_VOCAB_FORMAT", "fp8")
 _ROUTER_F32_CACHE = __import__("os").environ.get("VLLM_DS41_ROUTER_F32_CACHE") == "1"
+# Reduce the MoE output in bf16 instead of fp32 for steps of at least this
+# many tokens (0 = always fp32; default 64: prefill only).
+_AR_BF16_MIN_T = int(os.environ.get("VLLM_DS41_AR_BF16_MIN_T", "64"))
 
 
 def _expert_range(n_routed: int, tp: int, rank: int, layer: int) -> tuple[int, int]:
@@ -270,6 +273,10 @@ class XpuOffloadMoE(nn.Module):
                 out = out + self.shared_experts(x).float()
         if self.tp_size > 1 and "allreduce" not in _ABLATE:
             with prof.section("allreduce"):
+                if _AR_BF16_MIN_T and x.shape[0] >= _AR_BF16_MIN_T:
+                    # Prefill: reduce the bf16 result (half the bytes); the
+                    # sum is rounded to bf16 just below anyway.
+                    return tensor_model_parallel_all_reduce(out.to(x.dtype))
                 out = tensor_model_parallel_all_reduce(out)
         return out.to(x.dtype)
 
