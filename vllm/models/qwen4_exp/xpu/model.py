@@ -313,6 +313,10 @@ class HybridBlockFp8Mixin:
         from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 
         if isinstance(layer, LinearBase) and _HYBRID_FP8_LINEAR_RE.search(prefix):
+            from .int4_dense import int4_from_fp8_method, wants_int4
+
+            if wants_int4(prefix):
+                return int4_from_fp8_method(Fp8LinearMethod, self._hybrid_fp8_config)
             return Fp8LinearMethod(self._hybrid_fp8_config)
         return super().get_quant_method(layer, prefix)  # type: ignore[misc]
 
