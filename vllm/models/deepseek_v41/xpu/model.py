@@ -235,6 +235,7 @@ class XpuOffloadMoE(nn.Module):
     def forward(self, x: torch.Tensor, input_ids=None) -> torch.Tensor:
         with prof.section("router"):
             w, idx = self._route(x)
+            prof.note_experts(idx)
             out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         # The memory-profile / warm-up passes run without attention metadata:
         # skip routed experts there so the expert cache (allocated outside

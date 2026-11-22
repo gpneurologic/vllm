@@ -351,6 +351,9 @@ def _gemv3(x, w, idx_flat, qtype, e_start, n_local, xdiv):
 _FUSED_GLUE = __import__("os").environ.get("VLLM_DS41_MOE_FUSED_GLUE", "1") == "1"
 _SYCL = __import__("os").environ.get("VLLM_DS41_MOE_SYCL", "1") == "1"
 _sycl_ok: bool | None = None
+# output rows per sub-group in the SYCL kernel (activation reads shared by the
+# rows); 0: the original one-row kernel (VLLM_DS41_MOE_ROWS)
+_ROWS = int(__import__("os").environ.get("VLLM_DS41_MOE_ROWS", "8"))
 
 
 def _use_sycl() -> bool:
@@ -378,14 +381,20 @@ def moe_decode(x, idx, w, out, w13, w2, t13, t2, e_start, n_local, limit):
 
         idx_flat = idx.reshape(-1).to(torch.int32)
         H = x.shape[1]
-        h = iq.moe_mmvq(iq.quantize_q8_1(x.contiguous()), H, w13, t13, idx_flat, e_start,
-                        n_local, k)  # [P, 2I]
+        mmvq = iq.moe_mmvq2 if _ROWS and iq.has_rows() else None
+
+        def gemv(xq, K, W, qt, xdiv):
+            if mmvq is not None:
+                return mmvq(xq, K, W, qt, idx_flat, e_start, n_local, xdiv, _ROWS)
+            return iq.moe_mmvq(xq, K, W, qt, idx_flat, e_start, n_local, xdiv)
+
+        h = gemv(iq.quantize_q8_1(x.contiguous()), H, w13, t13, k)  # [P, 2I]
         P, I2 = h.shape
         I = I2 // 2
         a = torch.empty(P, I, dtype=torch.float32, device=x.device)
         _swiglu_kernel[(P, triton.cdiv(I, 1024))](h, a, I, float(limit or 0.0),
                                                   HAS_LIMIT=bool(limit), BLOCK=1024)
-        y = iq.moe_mmvq(iq.quantize_q8_1(a), I, w2, t2, idx_flat, e_start, n_local, 1)
+        y = gemv(iq.quantize_q8_1(a), I, w2, t2, 1)
         _combine_kernel[(T, triton.cdiv(H, 1024))](y, w.contiguous(), out, H, K_TOP=k,
                                                    KP=triton.next_power_of_2(k), BLOCK=1024)
         return

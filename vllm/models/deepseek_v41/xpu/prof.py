@@ -31,6 +31,9 @@ _COUNT_OPS = ENABLED and os.environ.get("VLLM_DS41_PROF_OPS") == "1"
 _PREFILL = os.environ.get("VLLM_DS41_PROF_PREFILL") == "1"
 _ALL_RANKS = os.environ.get("VLLM_DS41_PROF_ALL_RANKS") == "1"
 _MIN_TOKENS = int(os.environ.get("VLLM_DS41_PROF_MIN_TOKENS", "256"))
+# decode mode: profile steps of exactly this many tokens (DSpark verification: k + 1)
+_NTOK = int(os.environ.get("VLLM_DS41_PROF_NTOK", "1"))
+_experts = {"layers": 0, "pairs": 0, "distinct": 0}
 _EVERY = int(os.environ.get("VLLM_DS41_PROF_EVERY", "5" if _PREFILL else "50"))
 # steps not counted at the start (first calls compile Triton kernels)
 _SKIP = int(os.environ.get("VLLM_DS41_PROF_SKIP", "2" if _PREFILL else "20"))
@@ -75,7 +78,7 @@ def begin_step(num_tokens: int) -> None:
         _memlog(num_tokens)
     if not ENABLED:
         return
-    want = num_tokens >= _MIN_TOKENS if _PREFILL else num_tokens == 1
+    want = num_tokens >= _MIN_TOKENS if _PREFILL else num_tokens == _NTOK
     _state["active"] = want and not torch.xpu.is_current_stream_capturing()
     _state["ntok"] = num_tokens
     if _state["active"] and _state.get("seen", 0) < _SKIP:
@@ -115,6 +118,12 @@ def end_step() -> None:
                         "per step (ms): %s; other %.1f", rank, n, kind, _state["tokens"] / n,
                         _state["tokens"] / _state["step_total"], step, parts,
                         step - covered)
+            if _experts["layers"]:
+                e = _experts
+                logger.info("DS41PROF experts: %.1f token-expert pairs and %.1f distinct experts "
+                            "per MoE layer (%.2f pairs per distinct expert)",
+                            e["pairs"] / e["layers"], e["distinct"] / e["layers"],
+                            e["pairs"] / max(e["distinct"], 1))
             if _ops:
                 tot_ops = sum(_ops.values()) / n
                 parts = ", ".join(f"{k} {v / n:.0f}" for k, v in
@@ -151,3 +160,13 @@ def wrap_method(obj, method: str, name: str) -> None:
             return fn(*args, **kwargs)
 
     setattr(obj, method, wrapped)
+
+
+def note_experts(idx: torch.Tensor) -> None:
+    """Routed expert ids [T, top_k] of one MoE layer (all experts, not only this
+    rank's): counts pairs and distinct experts while a profiled step runs."""
+    if not (ENABLED and _state["active"]):
+        return
+    _experts["layers"] += 1
+    _experts["pairs"] += idx.numel()
+    _experts["distinct"] += int(torch.unique(idx).numel())
