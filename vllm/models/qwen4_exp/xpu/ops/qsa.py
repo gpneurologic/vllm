@@ -17,6 +17,26 @@ _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 # Launch profile override for the split-K sparse attention (see below).
 SPLITK_PROFILE = None
+
+
+def _b70_splitk_profile(rows: int, kv_heads: int, group: int) -> tuple[int, int, int, int]:
+    """(block_n, splits, warps, stages) for Arc Pro B70 (Xe2), from launch sweeps
+    under graph replay at 8 query heads, 1 KV head, head dim 256, FP8 K/V and
+    2051 selected positions. The GB300 profile's 64-token tiles are 5-8x slower
+    here from 32 rows up (e.g. 5.3 ms vs 0.65 ms at 40 rows, 202 vs 27 ms at
+    2048); 16-token tiles with fewer splits as rows grow are best throughout."""
+    programs = rows * kv_heads
+    if programs <= 32:
+        return 16, 32, 4, 2
+    if programs <= 64:
+        return 16, 16, 4, 2
+    if programs <= 512:
+        return 16, 8, 4, 2
+    return 16, 4, 4, 2
+
+
+if current_platform.is_xpu() and os.environ.get("VLLM_QWEN4_QSA_XPU_PROFILE", "1") == "1":
+    SPLITK_PROFILE = _b70_splitk_profile
 # Skip the scoring work of programs past the visible context (output identical).
 _SCORE_SKIP_INVISIBLE = os.environ.get("VLLM_QWEN4_QSA_SCORE_SKIP", "1") == "1"
 
