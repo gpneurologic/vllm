@@ -65,7 +65,12 @@ _SAFETENSORS_DTYPES = {
     "BF16": torch.bfloat16,
     "F16": torch.float16,
     "F32": torch.float32,
+    "U8": torch.uint8,
 }
+# INT4 tables (ple_to_int4.py, metadata ple_quant=int4g32): each row is 80 bytes
+# of 4-bit codes (value j: low nibble of byte j//2 if j is even, else high) then
+# one fp16 scale per 32 values, stored times scale_mult; value = (code - 8) * s.
+_INT4_GROUP = 32
 
 
 class PLETableFiles:
@@ -74,6 +79,10 @@ class PLETableFiles:
     def __init__(self, table_dir: str, row_dim: int) -> None:
         shards: dict[int, tuple[str, int, int, torch.dtype]] = {}
         scale: float | None = None
+        self.int4 = False
+        self.scale_mult = 1.0
+        self.row_dim = row_dim
+        int4_width = row_dim // 2 + 2 * (row_dim // _INT4_GROUP)
         paths = sorted(glob.glob(os.path.join(table_dir, "*.safetensors")))
         if not paths:
             raise ValueError(f"No safetensors files in PLE table dir {table_dir}")
@@ -82,6 +91,10 @@ class PLETableFiles:
                 header_len = struct.unpack("<Q", f.read(8))[0]
                 header = json.loads(f.read(header_len))
                 base = 8 + header_len
+                meta = header.get("__metadata__") or {}
+                if meta.get("ple_quant") == "int4g32":
+                    self.int4 = True
+                    self.scale_mult = float(meta.get("scale_mult", "1"))
                 for name, info in header.items():
                     if name == "__metadata__" or ".ngram_embedding." not in name:
                         continue
@@ -94,17 +107,20 @@ class PLETableFiles:
                         scale = float(torch.frombuffer(raw, dtype=dtype).float()[0])
                     elif leaf.startswith("shard_") and leaf.endswith(".weight"):
                         rows, dim = info["shape"]
-                        if dim != row_dim:
+                        want = int4_width if dtype == torch.uint8 else row_dim
+                        if dim != want:
                             raise ValueError(
                                 f"PLE shard {name} has row width {dim}, "
-                                f"expected {row_dim}"
+                                f"expected {want}"
                             )
                         shards[int(leaf[6:-7])] = (path, base + start, rows, dtype)
         if not shards or sorted(shards) != list(range(len(shards))):
             raise ValueError(f"PLE table in {table_dir} has missing shards")
         self.dtype = shards[0][3]
         self.shard_size = shards[0][2]
-        self.row_bytes = row_dim * self.dtype.itemsize
+        if self.dtype == torch.uint8 and not self.int4:
+            raise ValueError(f"PLE table in {table_dir}: uint8 rows without int4 metadata")
+        self.row_bytes = int4_width if self.int4 else row_dim * self.dtype.itemsize
         self.num_rows = sum(s[2] for s in shards.values())
         fds: dict[str, int] = {}
         self._fds: list[int] = []
@@ -131,11 +147,27 @@ class PLETableFiles:
             table_dir,
             self.num_rows,
             row_dim,
-            self.dtype,
+            "int4 g32" if self.int4 else self.dtype,
             len(shards),
             self.scale,
             _READ_THREADS,
         )
+
+    def decode(self, raw: torch.Tensor) -> torch.Tensor:
+        """Raw rows (uint8 [n, row_bytes], any device) -> float32 [n, row_dim]."""
+        n = raw.shape[0]
+        if self.int4:
+            half = self.row_dim // 2
+            codes = raw[:, :half]
+            q = torch.stack((codes & 0xF, codes >> 4), dim=-1).view(n, self.row_dim)
+            scales = raw[:, half:].contiguous().view(torch.float16).float()
+            scales = scales / self.scale_mult
+            vals = (q.float() - 8.0).view(n, -1, _INT4_GROUP) * scales[..., None]
+            return vals.view(n, self.row_dim)
+        rows = raw.view(self.dtype).to(torch.float32)
+        if self.scale != 1.0:
+            rows = rows * self.scale
+        return rows
 
     def read(self, ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         """Return the raw bytes of the rows `ids` (CPU int64) as [n, row_bytes].
@@ -284,10 +316,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEDeviceEmbedding):
         """Reference path: decode on the host. [T, H] ids -> [T, H, D] rows."""
         unique, inverse = self._unique(ids)
         raw = self._table.read(unique)
-        rows = raw.view(self._table.dtype).to(torch.float32)
-        if self._table.scale != 1.0:
-            rows = rows * self._table.scale
-        rows = _sim_int4(rows)
+        rows = _sim_int4(self._table.decode(raw))
         out = rows.index_select(0, inverse).to(self.weight.dtype)
         return out.view(*ids.shape, -1)
 
@@ -307,10 +336,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEDeviceEmbedding):
         raw = self._table.read(unique, out=self._pinned)
         raw_d = raw.to(dev, non_blocking=True)
         inv_d = inverse.to(dev, non_blocking=True)
-        rows = raw_d.view(self._table.dtype).to(torch.float32)
-        if self._table.scale != 1.0:
-            rows = rows * self._table.scale
-        rows = _sim_int4(rows)
+        rows = _sim_int4(self._table.decode(raw_d))
         out = rows.index_select(0, inv_d).to(self.weight.dtype)
         # The pinned buffer is reused next step: wait for the copy to finish.
         torch.accelerator.synchronize()
