@@ -91,6 +91,15 @@ logger = init_logger(__name__)
 
 _QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
 
+# Timing only (output is garbage): skip parts of every decoder layer so that a
+# graph-mode decode run shows what each part costs. Comma list of
+# ple, qsa, linear, moe (VLLM_QWEN4_ABLATE=moe,qsa).
+_ABLATE = frozenset(
+    p for p in os.environ.get("VLLM_QWEN4_ABLATE", "").split(",") if p
+)
+if _ABLATE:
+    logger.warning("Qwen4Exp ablation (timing only, output is wrong): %s", sorted(_ABLATE))
+
 
 def without_modelopt_fp4(
     quant_config: QuantizationConfig | None,
@@ -484,7 +493,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ngram_context: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
-        if self.ple is not None:
+        if self.ple is not None and "ple" not in _ABLATE:
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
             if prev_block_output is not None and prev_injection is not None:
@@ -514,7 +523,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             # Positions retain the full token axis for both text and MRoPE inputs.
             block_input = sp_all_gather(block_input)[: positions.shape[-1]]
         if self.layer_type == "linear_attention":
-            attn_out = self.linear_attn(hidden_states=block_input)
+            if "linear" in _ABLATE:
+                attn_out = torch.zeros_like(block_input)
+            else:
+                attn_out = self.linear_attn(hidden_states=block_input)
+        elif self.layer_type in _QSA_LAYER_TYPES and "qsa" in _ABLATE:
+            attn_out = torch.zeros_like(block_input)
         elif self.layer_type in _QSA_LAYER_TYPES:
             attn_out = self.self_attn(
                 hidden_states=block_input,
@@ -529,7 +543,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, attn_out, injection
         )
-        if self.use_sequence_parallel:
+        if "moe" in _ABLATE:
+            mlp_out = torch.zeros_like(block_input)
+        elif self.use_sequence_parallel:
             # MoE consumes local tokens and returns complete local outputs.
             mlp_out = self.mlp(block_input, already_sequence_parallel=True)
         else:

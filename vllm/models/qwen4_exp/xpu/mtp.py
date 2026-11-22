@@ -552,12 +552,20 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
                 dev = next(self.model.parameters()).device
                 rows = weight.index_select(0, self._draft_ids_local.to(weight.device))
                 w = rows.to(device=dev, dtype=dtype).contiguous()
-                if os.environ.get("VLLM_MTP_DRAFT_HEAD", "").lower() == "fp8":
+                head_fmt = os.environ.get("VLLM_MTP_DRAFT_HEAD", "").lower()
+                if head_fmt == "fp8":
                     from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (  # noqa: E501
                         quantize_rows_fp8,
                     )
 
                     w, self._draft_scale = quantize_rows_fp8(w)
+                elif head_fmt == "int4":
+                    from vllm.model_executor.layers.quantization.xpu_int4_weight_only import (  # noqa: E501
+                        quantize_int4,
+                    )
+
+                    w, self._draft_scale = quantize_int4(w)
+                    self._draft_int4 = True
                 self._draft_weight = w
                 self._draft_ids_all = self._draft_ids_all.to(dev)
                 self._draft_ids_local = self._draft_ids_local.to(dev)
@@ -566,7 +574,11 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
                     "the full lm_head",
                     w.shape[0],
                     w.shape[1],
-                    "fp8" if self._draft_scale is not None else str(w.dtype),
+                    "int4"
+                    if getattr(self, "_draft_int4", False)
+                    else "fp8"
+                    if self._draft_scale is not None
+                    else str(w.dtype),
                     w.numel() * w.element_size() / 2**20,
                 )
             yield name, weight
@@ -574,6 +586,12 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
     def _draft_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         w = self._draft_weight
         assert w is not None
+        if getattr(self, "_draft_int4", False):
+            from vllm.model_executor.layers.quantization.xpu_int4_weight_only import (
+                int4_linear,
+            )
+
+            return int4_linear(hidden_states, w, self._draft_scale)
         if self._draft_scale is not None:
             from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
                 fp8_linear,
@@ -635,7 +653,13 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
                 keep=lm_head is not None,
             )
         loaded = loader.load_weights(self._draft_vocab_capture(remapped), mapper=mapper)
-        if os.environ.get("VLLM_MTP_FP8", "0") == "1":
+        if os.environ.get("VLLM_MTP_INT4", "0") == "1":
+            from vllm.model_executor.layers.quantization.xpu_int4_weight_only import (
+                convert_unquantized_linears_int4,
+            )
+
+            convert_unquantized_linears_int4(self.model, "MTP draft layer")
+        elif os.environ.get("VLLM_MTP_FP8", "0") == "1":
             from vllm.model_executor.layers.quantization.xpu_fp8_weight_only import (
                 convert_unquantized_linears_fp8,
             )
