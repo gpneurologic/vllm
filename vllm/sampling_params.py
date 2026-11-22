@@ -913,7 +913,6 @@ class SamplingParams(
         tokenizer: TokenizerLike | None,
     ) -> None:
         self._validate_logprobs(model_config)
-        self._validate_spec_prompt_logprobs(speculative_config)
         self._validate_logit_bias(model_config)
         self._validate_trace_replay(model_config, speculative_config)
         self._validate_stop_token_ids(model_config)
@@ -922,27 +921,6 @@ class SamplingParams(
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
         )
-
-    def _validate_spec_prompt_logprobs(
-        self, speculative_config: SpeculativeConfig | None
-    ) -> None:
-        # On XPU, DSpark with prompt logprobs faults on the GPU copy engine and
-        # takes the engine down (DeepSeek V4.1 GGUF bring-up); refuse the request.
-        if (
-            self.prompt_logprobs is None
-            or speculative_config is None
-            or speculative_config.method != "dspark"
-        ):
-            return
-        from vllm.platforms import current_platform
-
-        if current_platform.is_xpu():
-            raise VLLMValidationError(
-                "prompt_logprobs is not supported with DSpark speculative "
-                "decoding on XPU",
-                parameter="prompt_logprobs",
-                value=self.prompt_logprobs,
-            )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs

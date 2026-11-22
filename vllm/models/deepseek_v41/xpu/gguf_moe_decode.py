@@ -353,7 +353,8 @@ _SYCL = __import__("os").environ.get("VLLM_DS41_MOE_SYCL", "1") == "1"
 _sycl_ok: bool | None = None
 # output rows per sub-group in the SYCL kernel (activation reads shared by the
 # rows); 0: the original one-row kernel (VLLM_DS41_MOE_ROWS)
-_ROWS = int(__import__("os").environ.get("VLLM_DS41_MOE_ROWS", "8"))
+# 4 rows beat 8 once the kernel loads whole tiles (A/B, graph mode, DSpark on).
+_ROWS = int(__import__("os").environ.get("VLLM_DS41_MOE_ROWS", "4"))
 
 
 def _use_sycl() -> bool:

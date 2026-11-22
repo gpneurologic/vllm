@@ -17,7 +17,22 @@ from vllm.v1.worker.gpu.sample.logprob import (
     compute_topk_scores,
 )
 
-CHUNK_SIZE = 1024
+# Prompt tokens per logits chunk: each chunk materializes [chunk, vocab]
+# logits (plus a log-softmax copy), so a smaller chunk lowers peak memory.
+# XPU defaults to 256: at 1024 a ~130k vocab took the last free memory with
+# speculative decoding on, and the GPU copy engine faulted.
+def _default_chunk() -> str:
+    try:
+        from vllm.platforms import current_platform
+
+        return "256" if current_platform.is_xpu() else "1024"
+    except Exception:
+        return "1024"
+
+
+CHUNK_SIZE = int(
+    __import__("os").environ.get("VLLM_PROMPT_LOGPROBS_CHUNK") or _default_chunk()
+)
 # Cap rows x k per torch.topk call, whose workspace grows with both (~5.5 GiB
 # for 1024 rows at a 152k vocab). Only splits chunks when k is very large.
 TOPK_MAX_ELEMENTS = 64 << 20
