@@ -56,16 +56,26 @@ def _launch(x3, w, s, groups, out_dtype, block_n, block_k, k_per, num_warps=4):
 
 
 def fp8_grouped_gemv(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor, groups: int,
-                     block_n: int = 32, block_k: int = 256, k_per: int = 2) -> torch.Tensor:
+                     block_n: int | None = None, block_k: int | None = None,
+                     k_per: int | None = None, num_warps: int | None = None) -> torch.Tensor:
     """x [T, G, K] (any float dtype), w [G*R, K] fp8, s [G*R/32, K/32] float.
-    Returns float32 [T, G, R]."""
+    Returns float32 [T, G, R].
+
+    Default launch from a graph-replay sweep on Arc Pro B70 for wo_a at TP=3
+    (G=3, R=1024, K=4096): 1 token 8 rows x whole K per program (no split-K
+    reduction), 52.8 -> 27.3 us; 2+ tokens 8 rows, 4 x 256 K per program,
+    63.7 -> 42.9 us."""
     T, G, K = x.shape
+    if block_n is None:
+        block_n, block_k, k_per, num_warps = ((8, 512, triton.cdiv(K, 512), 4) if T == 1
+                                              else (8, 256, 4, 2))
     N = w.shape[0]
     assert G == groups and N % G == 0 and w.shape[1] == K and w.stride(1) == 1
     assert (N // G) % block_n == 0
     if s.dtype == torch.float8_e8m0fnu:
         s = s.view(torch.uint8).to(torch.int32).sub(127).float().exp2()
-    y = _launch(x.contiguous(), w, s, G, torch.float32, block_n, block_k, k_per)
+    y = _launch(x.contiguous(), w, s, G, torch.float32, block_n, block_k, k_per,
+                num_warps or 4)
     return y.view(T, G, N // G)
 
 
