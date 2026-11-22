@@ -68,6 +68,9 @@ from .offload import DiskEngramEmbedding, ExpertCache, run_expert
 
 logger = init_logger(__name__)
 _DEBUG = __import__("os").environ.get("VLLM_DS41_DEBUG") == "1"
+# Timing experiments only (wrong outputs): skip parts of the model, comma list of
+# moe, shared, attn, allreduce (VLLM_DS41_ABLATE).
+_ABLATE = set(filter(None, __import__("os").environ.get("VLLM_DS41_ABLATE", "").split(",")))
 _TORCH_ROUTER = __import__("os").environ.get("VLLM_DS41_TORCH_ROUTER") == "1"
 _MHC_TRITON = __import__("os").environ.get("VLLM_DS41_MHC_TRITON", "1") == "1"
 # wo_a in INT4 cost ~2.5% perplexity in tests, so it stays FP8 unless asked.
@@ -245,7 +248,7 @@ class XpuOffloadMoE(nn.Module):
             get_forward_context().attn_metadata, dict
         )
         if self.gguf:
-            if x.shape[0] > 0 and self.w13 is not None:
+            if x.shape[0] > 0 and self.w13 is not None and "moe" not in _ABLATE:
                 with prof.section("routed_moe"):
                     run_gguf_experts(x, idx, w, out, self.w13, self.w2, self.t13, self.t2,
                                      self.e_start, self.n_local, self.swiglu_limit)
@@ -262,9 +265,10 @@ class XpuOffloadMoE(nn.Module):
                         0, rows,
                         run_expert(x[rows], parts, self.swiglu_limit, w[rows, slot, None]),
                     )
-        with prof.section("shared_expert"):
-            out = out + self.shared_experts(x).float()
-        if self.tp_size > 1:
+        if "shared" not in _ABLATE:
+            with prof.section("shared_expert"):
+                out = out + self.shared_experts(x).float()
+        if self.tp_size > 1 and "allreduce" not in _ABLATE:
             with prof.section("allreduce"):
                 out = tensor_model_parallel_all_reduce(out)
         return out.to(x.dtype)
@@ -374,11 +378,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         with prof.section("attention"):
             x = self.attn_norm(x)
-            x = self.attn(positions, x, None)
+            if "attn" not in _ABLATE:
+                x = self.attn(positions, x, None)
         if _DEBUG:
             torch.accelerator.synchronize()
             logger.info("DS41DBG   after attn, host avail %d MiB", _avail_mib())
-        if self.attn.wo_b.reduce_results is False:
+        if self.attn.wo_b.reduce_results is False and "allreduce" not in _ABLATE:
             with prof.section("allreduce"):
                 x = tensor_model_parallel_all_reduce(x)
         ffn_args = self._pre_args(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
