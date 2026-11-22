@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -14,6 +15,8 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+# Skip the scoring work of programs past the visible context (output identical).
+_SCORE_SKIP_INVISIBLE = os.environ.get("VLLM_QWEN4_QSA_SCORE_SKIP", "1") == "1"
 
 
 @triton.jit
@@ -47,6 +50,7 @@ def _qsa_mqa_paged_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    SKIP_INVISIBLE: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -88,22 +92,29 @@ def _qsa_mqa_paged_kernel(
     safe_physical_page = tl.maximum(physical_page, 0).to(tl.int64)
     score = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    for head in tl.static_range(0, NUM_HEADS):
-        query = tl.load(
-            q_ptr + row * stride_q_row + head * stride_q_head + dims * stride_q_dim,
-            mask=dims < HEAD_DIM,
-            other=0.0,
-        ).to(tl.float32)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_physical_page[:, None] * stride_cache_block
-            + page_offset[:, None] * stride_cache_token
-            + dims[None, :] * stride_cache_dim,
-            mask=valid[:, None] & (dims[None, :] < HEAD_DIM),
-            other=0.0,
-        ).to(tl.float32)
-        dot = tl.sum(keys * query[None, :], axis=1)
-        score += tl.maximum(dot, 0.0)
+    # The score row spans the whole page-table capacity (the configured
+    # window), so most programs of a short context see no visible column.
+    # They only store -inf; skipping their head loop gives identical output.
+    if (not SKIP_INVISIBLE) or (tl.program_id(1) * BLOCK_N < visible):
+        for head in tl.static_range(0, NUM_HEADS):
+            query = tl.load(
+                q_ptr
+                + row * stride_q_row
+                + head * stride_q_head
+                + dims * stride_q_dim,
+                mask=dims < HEAD_DIM,
+                other=0.0,
+            ).to(tl.float32)
+            keys = tl.load(
+                k_cache_ptr
+                + safe_physical_page[:, None] * stride_cache_block
+                + page_offset[:, None] * stride_cache_token
+                + dims[None, :] * stride_cache_dim,
+                mask=valid[:, None] & (dims[None, :] < HEAD_DIM),
+                other=0.0,
+            ).to(tl.float32)
+            dot = tl.sum(keys * query[None, :], axis=1)
+            score += tl.maximum(dot, 0.0)
 
     score /= score_divisor
     tl.store(
@@ -671,6 +682,7 @@ def qsa_mqa_paged(
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
         COMPRESS_RATIO=compress_ratio,
+        SKIP_INVISIBLE=_SCORE_SKIP_INVISIBLE,
         num_warps=4,
     )
     return logits, visible_blocks
