@@ -37,6 +37,29 @@ _SKIP = int(os.environ.get("VLLM_DS41_PROF_SKIP", "2" if _PREFILL else "20"))
 _tot: dict[str, float] = defaultdict(float)
 _ops: dict[str, int] = defaultdict(int)
 _stack: list[str] = []
+_MEMLOG = os.environ.get("VLLM_DS41_MEMLOG") == "1"
+_memstate = {"n": 0}
+
+
+def _memlog(num_tokens: int) -> None:
+    """Rank 0, prefill-sized steps: allocated / reserved / peak since the last
+    log (GiB) and the driver's free memory, so growth with context shows up."""
+    if num_tokens < _MIN_TOKENS or torch.xpu.is_current_stream_capturing():
+        return
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() != 0 and not _ALL_RANKS:
+        return
+    _memstate["n"] += 1
+    g = 2**30
+    free, total = torch.xpu.mem_get_info()
+    logger.info("DS41MEM rank %d step %d tokens %d: allocated %.2f reserved %.2f peak %.2f "
+                "free %.2f GiB", get_tensor_model_parallel_rank(), _memstate["n"], num_tokens,
+                torch.xpu.memory_allocated() / g, torch.xpu.memory_reserved() / g,
+                torch.xpu.max_memory_allocated() / g, free / g)
+    torch.xpu.reset_peak_memory_stats()
+
+
 _state = {"steps": 0, "active": False, "t0": 0.0, "step_total": 0.0, "mode": None}
 
 
@@ -48,6 +71,8 @@ class _OpCounter(TorchDispatchMode):
 
 def begin_step(num_tokens: int) -> None:
     """Called at the start of the model forward."""
+    if _MEMLOG:
+        _memlog(num_tokens)
     if not ENABLED:
         return
     want = num_tokens >= _MIN_TOKENS if _PREFILL else num_tokens == 1

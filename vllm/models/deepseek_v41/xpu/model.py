@@ -61,7 +61,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 
 from .attention_xpu import DeepseekV41XPUAttention
-from . import prof
+from . import alloc_trim, prof
 from .mhc_xpu import XpuMHCPreDelayed
 from .gguf_loader import GgufEngramEmbedding, gguf_path, load_expert_slice, run_gguf_experts
 from .offload import DiskEngramEmbedding, ExpertCache, run_expert
@@ -460,6 +460,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         self.end_layer - 1, type(md).__name__,
                         None if input_ids is None else tuple(input_ids.shape),
                         None if lookback_token_ids is None else tuple(lookback_token_ids.shape))
+        alloc_trim.maybe_trim(positions.shape[0])
         prof.begin_step(positions.shape[0])
         if get_pp_group().is_first_rank:
             hidden_states = (
