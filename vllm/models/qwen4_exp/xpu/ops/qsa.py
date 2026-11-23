@@ -757,6 +757,23 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
+    from .. import qsa_score_dot as _score_dot
+
+    if _score_dot.usable(q, k_cache):
+        _score_dot.score(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            columns,
+            score_divisor,
+            logits,
+            visible_blocks,
+        )
+        return logits, visible_blocks
     block_n = 32
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,

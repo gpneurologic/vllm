@@ -33,6 +33,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Static,
 )
 from vllm.platforms import current_platform
+from vllm.model_executor.layers.fused_moe.experts import xpu_moe_decode as _moe_decode
 
 if current_platform.is_xpu():
     from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
@@ -172,6 +173,33 @@ class XPUExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             # expert not owned by this rank so they are skipped.
             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
             topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
+        if (
+            _moe_decode.applies(hidden_states.shape[0])
+            and getattr(self.fused_moe_impl, "is_int4", False)
+            and getattr(self.fused_moe_impl, "_uses_xe2", False)
+            and self._lora_context is None
+            and not apply_router_weight_on_input
+            and self.w1_bias is None
+            and self.w2_bias is None
+            and self.gemm1_clamp_limit is None
+            and activation == MoEActivation.SILU
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            # A few tokens: GEMV-style kernels over the same relayouted
+            # weights beat the grouped GEMM (see xpu_moe_decode.py).
+            _moe_decode.moe_decode(
+                output,
+                hidden_states.contiguous(),
+                topk_weights,
+                topk_ids,
+                w1,
+                self.w1_scale,
+                w2,
+                self.w2_scale,
+                expert_map,
+                self.moe_config.ep_rank * self.moe_config.num_local_experts,
+            )
+            return
         self._apply_experts(
             output,
             hidden_states,
