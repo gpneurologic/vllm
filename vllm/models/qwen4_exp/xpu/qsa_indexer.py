@@ -307,7 +307,13 @@ class QSAIndexer(nn.Module):
             dtype=self.indexer_dtype,
         )
         main_kv_cache = attn.kv_cache.transpose(1, 2)
-        if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        main_int4_layout = None
+        if attn.impl.kv_int4:
+            from . import kv_int4 as _kv_int4
+
+            main_kv_cache = _kv_int4.cache_view(attn.kv_cache)
+            main_int4_layout = _kv_int4.layout(attn.head_dim)
+        elif attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
             # Reinterpret the uint8 cache in the platform's native fp8 flavor,
             # matching the C++ cache-update op and the attention backend's
             # read-side views.
@@ -346,6 +352,7 @@ class QSAIndexer(nn.Module):
             main_k_scale=attn._k_scale_float,
             main_v_scale=attn._v_scale_float,
             main_gate_out=None if gate_out is None else gate_out[:num_tokens],
+            main_int4_layout=main_int4_layout,
         )
         return q, main_outputs
 

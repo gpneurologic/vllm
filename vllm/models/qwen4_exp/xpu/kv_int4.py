@@ -27,8 +27,19 @@ import torch
 from vllm.triton_utils import tl, triton
 
 ENABLED = os.environ.get("VLLM_QWEN4_KV_INT4", "0") == "1"
+# 1: the fused QSA prepare writes the INT4 cache (else a separate store).
+FUSED = os.environ.get("VLLM_QWEN4_KV_INT4_FUSED", "1") == "1"
 GROUP = 32
 ROPE_DIM = int(os.environ.get("VLLM_QWEN4_KV_INT4_ROPE", "64"))
+# 0: the MTP draft layer keeps an FP8 cache (its drafts lose acceptance at
+# long context when it reads INT4).
+MTP = os.environ.get("VLLM_QWEN4_KV_INT4_MTP", "1") == "1"
+
+
+def layer_uses_int4(prefix: str, cache_dtype: str) -> bool:
+    if not ENABLED or cache_dtype not in ("fp8", "fp8_e4m3"):
+        return False
+    return MTP or "mtp" not in prefix.split(".")
 
 
 @dataclass(frozen=True)
@@ -63,6 +74,35 @@ def slot_bytes(head_dim: int) -> int:
 def _round_clamp(x):
     r = tl.where(x >= 0, tl.floor(x + 0.5), -tl.floor(0.5 - x))
     return tl.minimum(tl.maximum(r, -7.0), 7.0)
+
+
+@triton.jit
+def pack_store_groups(base, x, NIB_OFF: tl.constexpr, SCALE_OFF: tl.constexpr,
+                      FIRST_G: tl.constexpr, GROUP: tl.constexpr):
+    """Quantize a register row x (D,) fp32 per GROUP dims and store the groups
+    from FIRST_G on: nibbles at base + NIB_OFF, fp16 scales at base + SCALE_OFF."""
+    D: tl.constexpr = x.shape[0]
+    NG: tl.constexpr = D // GROUP
+    half: tl.constexpr = GROUP // 2
+    xe, xo = tl.split(tl.reshape(x, (NG, half, 2)))
+    amax = tl.maximum(tl.max(tl.abs(xe), axis=1), tl.max(tl.abs(xo), axis=1))
+    scale = tl.maximum(amax / 7.0, 1e-8).to(tl.float16)
+    sf = scale.to(tl.float32)[:, None]
+    qe = _round_clamp(xe / sf).to(tl.int32) + 8
+    qo = _round_clamp(xo / sf).to(tl.int32) + 8
+    g = tl.arange(0, NG)
+    j = tl.arange(0, half)
+    m = g >= FIRST_G
+    tl.store(
+        base + NIB_OFF + (g[:, None] - FIRST_G) * half + j[None, :],
+        (qe | (qo << 4)).to(tl.uint8),
+        mask=m[:, None],
+    )
+    tl.store(
+        (base + SCALE_OFF + 2 * (g - FIRST_G)).to(tl.pointer_type(tl.float16)),
+        scale,
+        mask=m,
+    )
 
 
 @triton.jit(do_not_specialize=["num_tokens"])

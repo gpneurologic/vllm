@@ -178,6 +178,18 @@ class Qwen4ExpQSABackend(AttentionBackend):
         return False
 
 
+class Qwen4ExpQSADenseBackend(Qwen4ExpQSABackend):
+    """QSA backend for a layer kept dense while VLLM_QWEN4_KV_INT4 packs the others."""
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        from vllm.v1.attention.backends.rocm_octave_attn import (
+            RocmOctaveAttentionBackend,
+        )
+
+        return RocmOctaveAttentionBackend.customize_spec(spec)
+
+
 class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
     """Run paged sparse GQA with the QSA Triton kernel."""
 
@@ -188,6 +200,7 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         scale: float,
         num_kv_heads: int,
         kv_cache_dtype: str,
+        kv_int4: bool | None = None,
     ) -> None:
         """Initialize QSA state and preserve the optional Octave cache path."""
         if self.dcp_world_size != 1:
@@ -203,7 +216,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
-        self.kv_int4 = _kv_int4.ENABLED and kv_cache_dtype in ("fp8", "fp8_e4m3")
+        if kv_int4 is None:
+            kv_int4 = _kv_int4.ENABLED and kv_cache_dtype in ("fp8", "fp8_e4m3")
+        self.kv_int4 = kv_int4
         self.octave_fmt: rocm_octave.OctaveFormat | None = None
         if self.kv_cache_dtype in _OCTAVE_CACHE_DTYPES:
             self.octave_fmt = rocm_octave.OctaveFormat.from_cache_dtype(
@@ -527,13 +542,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
 
-        self.attn_backend = Qwen4ExpQSABackend
+        kv_int4 = _kv_int4.layer_uses_int4(prefix, self.kv_cache_dtype)
+        self.attn_backend = (
+            Qwen4ExpQSADenseBackend
+            if _kv_int4.ENABLED and not kv_int4
+            else Qwen4ExpQSABackend
+        )
         self.impl: Qwen4ExpQSAImpl = Qwen4ExpQSAImpl(  # type: ignore[assignment]
             self.num_heads,
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
             self.kv_cache_dtype,
+            kv_int4=kv_int4,
         )
         self.indexer = QSAIndexer(
             vllm_config=vllm_config,
@@ -551,7 +572,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             and self.head_dim & (self.head_dim - 1) == 0
             and self.kv_cache_dtype not in _OCTAVE_CACHE_DTYPES
             and not _kv_sim.ENABLED
-            and not _kv_int4.ENABLED
+            and (not _kv_int4.ENABLED or _kv_int4.FUSED)
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.register_buffer(

@@ -13,6 +13,8 @@ from torch import nn
 
 from vllm.triton_utils import tl, triton
 
+from ..kv_int4 import pack_store_groups
+
 
 def supports_fused_pre_indexer(
     rotary_emb: nn.Module,
@@ -209,6 +211,12 @@ def _qsa_prepare_kernel(
     MAIN_HK: tl.constexpr,
     MAIN_D: tl.constexpr,
     MAIN_PAGE_SIZE: tl.constexpr,
+    MAIN_INT4: tl.constexpr = False,
+    INT4_GROUP: tl.constexpr = 32,
+    INT4_K_NIB: tl.constexpr = 0,
+    INT4_V_NIB: tl.constexpr = 0,
+    INT4_K_SCALE: tl.constexpr = 0,
+    INT4_V_SCALE: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
@@ -263,9 +271,24 @@ def _qsa_prepare_kernel(
                     + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
                     + kv_head * main_cache_stride_head
                 )
-                _store_rotated(dst, y, o1, o2, main_k_scale)
-                v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+                if MAIN_INT4:
+                    # Packed INT4 slot (xpu/kv_int4.py): RoPE dims FP8, the rest
+                    # INT4 per group, after the same BF16 rounding.
+                    fp8_1 = o1.to(tl.bfloat16).to(tl.float32).to(tl.float8e4nv)
+                    fp8_2 = o2.to(tl.bfloat16).to(tl.float32).to(tl.float8e4nv)
+                    tl.store(dst + rot, fp8_1.to(tl.uint8, bitcast=True))
+                    tl.store(dst + HALF + rot, fp8_2.to(tl.uint8, bitcast=True))
+                    yk = y.to(tl.bfloat16).to(tl.float32)
+                    pack_store_groups(
+                        dst, yk, INT4_K_NIB, INT4_K_SCALE, (2 * HALF) // INT4_GROUP,
+                        INT4_GROUP,
+                    )
+                    v = tl.load(src + MAIN_HK * MAIN_D + dims).to(tl.float32)
+                    pack_store_groups(dst, v, INT4_V_NIB, INT4_V_SCALE, 0, INT4_GROUP)
+                else:
+                    _store_rotated(dst, y, o1, o2, main_k_scale)
+                    v = tl.load(src + MAIN_HK * MAIN_D + dims)
+                    tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
         else:
             out = (token * MAIN_HQ + head) * MAIN_D
             _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
@@ -547,6 +570,21 @@ def _qsa_prepare_kernel(
                     tl.store(tail + 2, pos_w.to(tl.int64), mask=valid_slot)
 
 
+def _int4_kwargs(lay, index_head_dim: int) -> dict:
+    if lay is None:
+        return {}
+    # The fused path rotates the first index_head_dim // 2 main dims.
+    assert lay.rope == index_head_dim // 2, (lay.rope, index_head_dim)
+    return dict(
+        MAIN_INT4=True,
+        INT4_GROUP=lay.group,
+        INT4_K_NIB=lay.k_nib,
+        INT4_V_NIB=lay.v_nib,
+        INT4_K_SCALE=lay.k_scale,
+        INT4_V_SCALE=lay.v_scale,
+    )
+
+
 def qsa_prepare(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -577,6 +615,7 @@ def qsa_prepare(
     main_k_scale: float,
     main_v_scale: float,
     main_gate_out: torch.Tensor | None = None,
+    main_int4_layout=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Normalize Q, compress K, then update the circular raw state.
 
@@ -585,7 +624,12 @@ def qsa_prepare(
     caller-owned buffer, e.g. one that outlives an opaque custom op.
     """
     num_tokens = q.shape[0]
-    main_head_dim = main_kv_cache.shape[-1] // 2
+    if main_int4_layout is not None:
+        main_head_dim = main_int4_layout.head_dim
+        assert main_kv_cache.dtype == torch.uint8
+        assert main_kv_cache.shape[-1] == main_int4_layout.slot
+    else:
+        main_head_dim = main_kv_cache.shape[-1] // 2
     num_main_kv_heads = main_kv_cache.shape[2]
     num_main_q_heads = main_qkv.shape[1] // (2 * main_head_dim) - num_main_kv_heads
     main_q_out = main_qkv.new_empty(num_tokens, num_main_q_heads, main_head_dim)
@@ -695,6 +739,7 @@ def qsa_prepare(
         MAIN_HK=num_main_kv_heads,
         MAIN_D=main_head_dim,
         MAIN_PAGE_SIZE=main_kv_cache.shape[1],
+        **_int4_kwargs(main_int4_layout, head_dim),
         num_warps=1,
     )
     return main_q_out, main_gate_out
