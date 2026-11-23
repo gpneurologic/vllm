@@ -188,6 +188,7 @@ class XpuOffloadMoE(nn.Module):
             self.n_routed, self.tp_size, get_tensor_model_parallel_rank(),
             int(self.prefix_ckpt.split(".")[1]))
         self.gate = _Gate(self.n_routed, config.hidden_size)
+        expert_stats.register_gate(int(self.prefix_ckpt.split(".")[1]), self.gate)
         self.shared_experts = DeepseekV4MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
@@ -250,6 +251,7 @@ class XpuOffloadMoE(nn.Module):
         real_step = is_forward_context_available() and isinstance(
             get_forward_context().attn_metadata, dict
         )
+        expert_stats.trace(int(self.prefix_ckpt.split(".")[1]), x, idx, real_step)
         if self.gguf:
             if x.shape[0] > 0 and self.w13 is not None and "moe" not in _ABLATE:
                 with prof.section("routed_moe"):
@@ -476,6 +478,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         None if lookback_token_ids is None else tuple(lookback_token_ids.shape))
         alloc_trim.maybe_trim(positions.shape[0])
         expert_stats.step()
+        expert_stats.trace_step()
         prof.begin_step(positions.shape[0])
         if get_pp_group().is_first_rank:
             hidden_states = (
