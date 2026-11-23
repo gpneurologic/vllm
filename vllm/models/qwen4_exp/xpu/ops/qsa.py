@@ -258,6 +258,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_FP8: tl.constexpr,
+    KV_INT4: tl.constexpr = False,
+    ROPE: tl.constexpr = 0,
+    GROUP: tl.constexpr = 32,
+    K_NIB: tl.constexpr = 0,
+    V_NIB: tl.constexpr = 0,
+    K_SCALE: tl.constexpr = 0,
+    V_SCALE: tl.constexpr = 0,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -277,6 +284,22 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         mask=head_offsets[:, None] < GROUP_SIZE,
         other=0.0,
     )
+    if KV_INT4:
+        # K is stored as [rope | non-rope]; split Q the same way (the non-rope
+        # part padded to HEAD_DIM with zeros).
+        rope_offsets = tl.arange(0, ROPE)
+        q_base = q_ptr + row * stride_q_row + (first_head + head_offsets[:, None]) * stride_q_head
+        q_rope = tl.load(
+            q_base + rope_offsets[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0.0,
+        )
+        q_nope = tl.load(
+            q_base + ROPE + dim_offsets[None, :],
+            mask=(head_offsets[:, None] < GROUP_SIZE)
+            & (dim_offsets[None, :] < HEAD_DIM - ROPE),
+            other=0.0,
+        )
 
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -312,33 +335,90 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        if IS_FP8:
-            # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (an fp8
-            # QK dot measured slower and less accurate on the NVIDIA port).
-            keys = keys.to(query.dtype)
-            # Dequant V to fp16 for the PV dot: P <= 1 (online softmax) so
-            # fp16 has the range, its wider mantissa is more accurate, and
-            # the fp8->fp16 upcast with an fp16 PV dot is faster.
-            values = values.to(tl.float16)
-        scores = tl.dot(query, keys)
+        if KV_INT4:
+            # One packed uint8 slot per (token, KV head), see xpu/kv_int4.py.
+            # Row loads per token; nibbles unpacked with interleave, one scale
+            # per GROUP dims. Scores = rope part + non-rope part.
+            slot_base = (
+                k_cache_ptr
+                + safe_page * stride_k_block
+                + page_offset * stride_k_token
+                + kv_head * stride_k_head
+            )
+            byte_cols = tl.arange(0, HEAD_DIM // 2)
+            group_cols = tl.arange(0, HEAD_DIM // GROUP)
+            k_rope_raw = tl.load(
+                slot_base[None, :] + rope_offsets[:, None],
+                mask=valid[None, :],
+                other=0,
+            )
+            k_rope = k_rope_raw.to(tl.float8e4nv, bitcast=True).to(query.dtype)
+            nope_bytes: tl.constexpr = (HEAD_DIM - ROPE) // 2
+            k_raw = tl.load(
+                slot_base[:, None] + K_NIB + byte_cols[None, :],
+                mask=valid[:, None] & (byte_cols[None, :] < nope_bytes),
+                other=0,
+            )
+            k_int = tl.interleave(k_raw & 15, k_raw >> 4).to(tl.int32) - 8
+            k_sc = tl.load(
+                (slot_base[:, None] + K_SCALE + 2 * group_cols[None, :]).to(
+                    tl.pointer_type(tl.float16)
+                ),
+                mask=valid[:, None] & (group_cols[None, :] < (HEAD_DIM - ROPE) // GROUP),
+                other=0.0,
+            ).to(tl.float32)
+            k_sc = tl.reshape(
+                tl.broadcast_to(k_sc[:, :, None], (BLOCK_N, HEAD_DIM // GROUP, GROUP)),
+                (BLOCK_N, HEAD_DIM),
+            )
+            k_nope = tl.trans((k_int.to(tl.float32) * k_sc).to(query.dtype))
+            scores = tl.dot(q_rope, k_rope) + tl.dot(q_nope, k_nope)
+            v_raw = tl.load(
+                slot_base[:, None] + V_NIB + byte_cols[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            v_int = tl.interleave(v_raw & 15, v_raw >> 4).to(tl.int32) - 8
+            v_sc = tl.load(
+                (slot_base[:, None] + V_SCALE + 2 * group_cols[None, :]).to(
+                    tl.pointer_type(tl.float16)
+                ),
+                mask=valid[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            v_sc = tl.reshape(
+                tl.broadcast_to(v_sc[:, :, None], (BLOCK_N, HEAD_DIM // GROUP, GROUP)),
+                (BLOCK_N, HEAD_DIM),
+            )
+            values = (v_int.to(tl.float32) * v_sc).to(tl.float16)
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            if IS_FP8:
+                # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (an fp8
+                # QK dot measured slower and less accurate on the NVIDIA port).
+                keys = keys.to(query.dtype)
+                # Dequant V to fp16 for the PV dot: P <= 1 (online softmax) so
+                # fp16 has the range, its wider mantissa is more accurate, and
+                # the fp8->fp16 upcast with an fp16 PV dot is faster.
+                values = values.to(tl.float16)
+            scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -863,6 +943,20 @@ def qsa_select_paged_tokens(
     return out
 
 
+def _int4_constexprs(lay) -> dict:
+    if lay is None:
+        return {}
+    return dict(
+        KV_INT4=True,
+        ROPE=lay.rope,
+        GROUP=lay.group,
+        K_NIB=lay.k_nib,
+        V_NIB=lay.v_nib,
+        K_SCALE=lay.k_scale,
+        V_SCALE=lay.v_scale,
+    )
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -871,8 +965,12 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    int4_layout=None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged bf16 or fp8 K/V caches."""
+    """Run sparse GQA directly over paged bf16 or fp8 K/V caches.
+
+    With ``int4_layout`` (xpu/kv_int4.Layout) K and V are one packed uint8
+    (blocks, tokens, kv_heads, slot) cache."""
     if q.device.type != "xpu" or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -885,14 +983,18 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention cache and block table must be nonempty")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+    if (int4_layout is None and q.shape[2] != k_cache.shape[3]) or q.shape[
+        1
+    ] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     is_fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
-    assert is_fp8 or k_cache.dtype == torch.bfloat16, (
+    assert is_fp8 or k_cache.dtype == (
+        torch.bfloat16 if int4_layout is None else torch.uint8
+    ), (
         "QSA sparse attention requires BF16 or FP8-e4m3 K/V"
     )
     assert logical_indices.dtype == block_table.dtype == torch.int32
@@ -997,6 +1099,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         IS_FP8=is_fp8,
+        **_int4_constexprs(int4_layout),
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

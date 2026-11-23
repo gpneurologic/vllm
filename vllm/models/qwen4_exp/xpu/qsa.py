@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import ClassVar, cast
 
 import torch
@@ -46,6 +47,7 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheLayerConfig,
+    KVQuantMode,
     get_kv_quant_mode,
 )
 from vllm.v1.worker.workspace import (
@@ -55,6 +57,7 @@ from vllm.v1.worker.workspace import (
 
 from ..common.qsa import Qwen4ExpQSAMetadata, Qwen4ExpQSAMetadataBuilder
 from ..common.qsa_indexer import QSAIndexerMetadata, qsa_kv_cache_dtype
+from . import kv_int4 as _kv_int4
 from . import kv_sim as _kv_sim
 from . import model
 from .qsa_indexer import QSAIndexer
@@ -133,6 +136,16 @@ class Qwen4ExpQSABackend(AttentionBackend):
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        # XPU INT4 main cache (VLLM_QWEN4_KV_INT4=1 with --kv-cache-dtype fp8):
+        # one packed slot per (token, KV head).
+        if (
+            _kv_int4.ENABLED
+            and spec.state_content_bytes is None
+            and spec.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+        ):
+            return replace(
+                spec, state_content_bytes=_kv_int4.slot_bytes(spec.head_size)
+            )
         from vllm.v1.attention.backends.rocm_octave_attn import (
             RocmOctaveAttentionBackend,
         )
@@ -190,6 +203,7 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.kv_int4 = _kv_int4.ENABLED and kv_cache_dtype in ("fp8", "fp8_e4m3")
         self.octave_fmt: rocm_octave.OctaveFormat | None = None
         if self.kv_cache_dtype in _OCTAVE_CACHE_DTYPES:
             self.octave_fmt = rocm_octave.OctaveFormat.from_cache_dtype(
@@ -257,6 +271,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         slot_mapping: torch.Tensor,
     ) -> None:
         """Store BF16 K/V directly or use the existing Octave cache writer."""
+        if self.kv_int4:
+            _kv_int4.store(key, value, kv_cache, slot_mapping, self.head_size)
+            return
         if self.octave_fmt is None:
             if _kv_sim.ENABLED:
                 key, value = _kv_sim.roundtrip(key, value, self.head_size)
@@ -343,6 +360,21 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
                 self._wtags,
                 self._stab,
                 self._stags,
+            )
+            return output
+        if self.kv_int4:
+            from .ops.qsa import qsa_sparse_paged_attention
+
+            cache = _kv_int4.cache_view(kv_cache)
+            qsa_sparse_paged_attention(
+                query[:num_tokens],
+                cache,
+                cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                output[:num_tokens],
+                int4_layout=_kv_int4.layout(self.head_size),
             )
             return output
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
@@ -519,6 +551,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             and self.head_dim & (self.head_dim - 1) == 0
             and self.kv_cache_dtype not in _OCTAVE_CACHE_DTYPES
             and not _kv_sim.ENABLED
+            and not _kv_int4.ENABLED
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.register_buffer(
