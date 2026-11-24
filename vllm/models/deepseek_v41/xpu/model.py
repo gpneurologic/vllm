@@ -87,6 +87,12 @@ _AR_BF16_MIN_T = int(os.environ.get("VLLM_DS41_AR_BF16_MIN_T", "64"))
 # Streamed experts (VLLM_DS41_STREAM_DIR): steps of at most this many tokens use
 # the batched FP4 decode kernel; longer steps run expert by expert.
 _STREAM_GEMV_MAX_T = int(os.environ.get("VLLM_DS41_STREAM_GEMV_MAX_T", "16"))
+# Same-token lookahead for streamed experts: at layer l, layers l+1..l+N
+# route the current MoE input and their predicted (not resident) experts are
+# queued as low-priority reads, so they overlap this layer's wait and compute.
+_LOOKAHEAD = int(os.environ.get("VLLM_DS41_LOOKAHEAD", "0"))
+_LOOKAHEAD_EXTRA = int(os.environ.get("VLLM_DS41_LOOKAHEAD_EXTRA", "2"))
+_STREAM_MOES: dict = {}  # layer id -> XpuOffloadMoE (main layers)
 
 
 def _expert_range(n_routed: int, tp: int, rank: int, layer: int) -> tuple[int, int]:
@@ -197,6 +203,8 @@ class XpuOffloadMoE(nn.Module):
             int(self.prefix_ckpt.split(".")[1]))
         self.gate = _Gate(self.n_routed, config.hidden_size)
         expert_stats.register_gate(int(self.prefix_ckpt.split(".")[1]), self.gate)
+        if self.layer_id < self.n_layers:
+            _STREAM_MOES[self.layer_id] = self
         self.shared_experts = DeepseekV4MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
@@ -238,6 +246,12 @@ class XpuOffloadMoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
         )
         return w, idx
+
+    def _pred_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """Biased routing scores of this layer's router for x (lookahead)."""
+        gw = self.gate.weight
+        logits = F.linear(x.to(gw.dtype), gw).float()
+        return F.softplus(logits).sqrt() + self.gate.e_score_correction_bias
 
     def load_gguf_experts(self, ck) -> int:
         layer = int(self.prefix_ckpt.split(".")[1])
@@ -308,11 +322,39 @@ class XpuOffloadMoE(nn.Module):
             return
         tm = expert_stream.TIMING
         t0 = time.perf_counter() if tm else 0.0
-        local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
-        experts = torch.unique(idx[local]).tolist()
+        T = x.shape[0]
+        nexts = []
+        if _LOOKAHEAD and T <= _STREAM_GEMV_MAX_T:
+            for d in range(1, _LOOKAHEAD + 1):
+                nm = _STREAM_MOES.get(self.layer_id + d)
+                if nm is None:
+                    break
+                nexts.append(nm)
+        if nexts:
+            # one host transfer for this layer's routing and the predictions
+            kp = self.topk + _LOOKAHEAD_EXTRA
+            preds = [nm._pred_scores(x).topk(kp, dim=-1)[1].reshape(-1) for nm in nexts]
+            vals = torch.cat([idx.reshape(-1).to(torch.int64)] + preds).tolist()
+            n0 = idx.numel()
+            experts = sorted({v for v in vals[:n0]
+                              if self.e_start <= v < self.e_start + self.n_local})
+        else:
+            local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
+            experts = torch.unique(idx[local]).tolist()
+        cache = expert_stream.StreamCache.get(x.device, self.n_layers)
+        if nexts:
+            keys, seen = [], set()
+            for j, nm in enumerate(nexts):  # nearer layers first
+                base = n0 + j * T * kp
+                for t in range(T):
+                    for r in range(kp):  # rank-major within a token
+                        v = vals[base + t * kp + r]
+                        if nm.e_start <= v < nm.e_start + nm.n_local and (nm.layer_id, v) not in seen:
+                            seen.add((nm.layer_id, v))
+                            keys.append((nm.layer_id, v))
+            cache.prefetch(keys)
         if not experts:
             return
-        cache = expert_stream.StreamCache.get(x.device, self.n_layers)
         t1 = time.perf_counter() if tm else 0.0
         with prof.section("expert_fetch"):
             slot_row = cache.ensure(self.layer_id, experts)

@@ -168,7 +168,8 @@ class StreamCache:
         self.seq = 0
         self.pf_round = 0
         self.stats = dict(hits=0, misses=0, pf_issued=0, pf_used=0, pf_dropped=0,
-                          read_bytes=0, wait_s=0.0, steps=0)
+                          pf_hit=0, pf_wasted=0, read_bytes=0, wait_s=0.0, steps=0)
+        self.pf_keys: set = set()               # installed by prefetch, not yet demanded
         self._last_log = time.time()
         for _ in range(self.n_threads):
             threading.Thread(target=self._reader, daemon=True).start()
@@ -261,6 +262,9 @@ class StreamCache:
         for key in self.lru:
             if key not in protect:
                 slot = self.lru.pop(key)
+                if key in self.pf_keys:
+                    self.pf_keys.discard(key)
+                    self.stats["pf_wasted"] += 1
                 self.slot_cpu[key[0], key[1]] = -1
                 self._dirty.add(key[0])
                 return slot
@@ -290,6 +294,8 @@ class StreamCache:
         else:
             self.staging.release(f.buf)
         self.lru[f.key] = slot
+        if f.prio > 0:
+            self.pf_keys.add(f.key)
         self.slot_cpu[f.key[0], f.key[1]] = slot
         self._dirty.add(f.key[0])
         self.stats["read_bytes"] += self.block
@@ -305,6 +311,9 @@ class StreamCache:
             if k in self.lru:
                 self.lru.move_to_end(k)
                 self.stats["hits"] += 1
+                if k in self.pf_keys:
+                    self.pf_keys.discard(k)
+                    self.stats["pf_hit"] += 1
             else:
                 need.append(k)
         if need:
@@ -315,6 +324,11 @@ class StreamCache:
             pending: list = []
             while todo or pending:
                 while todo and len(pending) < cap:
+                    if not self.staging.free and not self.staging.pending:
+                        # every buffer is held by a read in flight (prefetches)
+                        if pending:
+                            break
+                        self._make_room(protect)
                     k = todo.pop(0)
                     f = self.inflight.get(k)
                     if f is not None:
@@ -350,6 +364,24 @@ class StreamCache:
         self._maybe_log()
         return self.slot_dev[layer]
 
+    def _make_room(self, protect: set) -> None:
+        """Free a staging buffer for a demand read: install landed prefetches,
+        cancel queued ones, wait for a started one to finish."""
+        while not self.staging.free and not self.staging.pending:
+            self._flush_prefetched(protect)
+            if self.staging.free or self.staging.pending:
+                return
+            with self.qlock:
+                for _, _, f, _ in self.q:
+                    if f.prio > 0 and not f.started and not f.cancel:
+                        f.cancel = True
+                        self.stats["pf_dropped"] += 1
+                        if self.inflight.get(f.key) is f:
+                            del self.inflight[f.key]
+                        self._zombies.append(f)
+            with self.done_cv:
+                self.done_cv.wait(0.01)
+
     def _flush_prefetched(self, protect: set) -> None:
         """Install prefetches that have landed (no waiting); free the buffers
         of cancelled fetches whose pieces have all been dropped."""
@@ -365,8 +397,9 @@ class StreamCache:
         """Queue low-priority reads (only into free staging buffers, keeping a
         margin for demand reads); drops older prefetches not yet started."""
         self.pf_round += 1
+        want = set(keys)
         with self.qlock:
-            old = {id(f): f for _, _, f, _ in self.q if f.prio > 0}
+            old = {id(f): f for _, _, f, _ in self.q if f.prio > 0 and f.key not in want}
             for f in old.values():
                 if not f.started and not f.cancel:
                     f.cancel = True
@@ -413,7 +446,8 @@ class StreamCache:
         s = self.stats
         tot = s["hits"] + s["misses"] + s["pf_used"]
         logger.info("expert stream: %d resident, hit %.1f%% (%d hits, %d misses, %d from "
-                    "prefetch; %d prefetches, %d dropped), %.1f GiB read, wait %.1f s",
+                    "prefetch; %d prefetches, %d dropped, %d landed+used, %d evicted unused), "
+                    "%.1f GiB read, wait %.1f s",
                     len(self.lru), 100.0 * s["hits"] / max(tot, 1), s["hits"], s["misses"],
-                    s["pf_used"], s["pf_issued"], s["pf_dropped"], s["read_bytes"] / 2**30,
-                    s["wait_s"])
+                    s["pf_used"], s["pf_issued"], s["pf_dropped"], s["pf_hit"], s["pf_wasted"],
+                    s["read_bytes"] / 2**30, s["wait_s"])
