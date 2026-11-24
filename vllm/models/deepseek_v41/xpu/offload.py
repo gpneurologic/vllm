@@ -387,6 +387,11 @@ class DiskEngramEmbedding(nn.Module):
                 and isinstance(get_forward_context().attn_metadata, dict)):
             rows.zero_()  # profile / warm-up pass: no disk reads
             return
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+        if BreakableCUDAGraphCapture.current() is not None:
+            rows.zero_()  # graph capture: hash ids are garbage, real reads at replay
+            return
         local = hash_ids[:, self.head_start : self.head_end]
         n, c = local.shape
         if n == 0:

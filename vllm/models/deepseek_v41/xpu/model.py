@@ -13,6 +13,7 @@ and prefill-context parallel). XPU-specific parts:
 """
 
 import os
+import time
 import typing
 from collections.abc import Iterable
 from itertools import islice
@@ -299,19 +300,35 @@ class XpuOffloadMoE(nn.Module):
         if not (is_forward_context_available()
                 and isinstance(get_forward_context().attn_metadata, dict)):
             return  # memory profile / warm-up pass: no expert reads
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+        if BreakableCUDAGraphCapture.current() is not None:
+            # Graph capture: the router ran inside a captured (not executed)
+            # segment, so idx is garbage; the real work happens at replay.
+            return
+        tm = expert_stream.TIMING
+        t0 = time.perf_counter() if tm else 0.0
         local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
         experts = torch.unique(idx[local]).tolist()
         if not experts:
             return
         cache = expert_stream.StreamCache.get(x.device, self.n_layers)
+        t1 = time.perf_counter() if tm else 0.0
         with prof.section("expert_fetch"):
             slot_row = cache.ensure(self.layer_id, experts)
+        t2 = time.perf_counter() if tm else 0.0
         with prof.section("routed_moe"):
             if x.shape[0] <= _STREAM_GEMV_MAX_T:
                 from .fp4_moe import moe_decode_fp4
 
                 moe_decode_fp4(x, idx, w, out, cache.pool, slot_row, cache.lay,
                                self.swiglu_limit)
+                if tm:
+                    t3 = time.perf_counter()
+                    if tm == 2:
+                        torch.xpu.synchronize()
+                    cache.note_timing(x.shape[0], t1 - t0, t2 - t1, t3 - t2,
+                                      time.perf_counter() - t3)
                 return
             for e in experts:
                 rows, slot = torch.where(idx == e)

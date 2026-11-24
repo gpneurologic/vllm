@@ -21,6 +21,14 @@ Settings:
   VLLM_DS41_STREAM_GB       pool size in GiB per rank (default 16)
   VLLM_DS41_READ_THREADS    reader threads (default 16)
   VLLM_DS41_STAGING         pinned staging buffers (default 32, ~18.8 MB each)
+  VLLM_DS41_STREAM_MIRRORS  comma list of "<folder>:<weight>" copies of the
+                            expert file on other drives, e.g.
+                            "/g/ds41-experts:1" with the main file weight
+                            VLLM_DS41_STREAM_WEIGHT (default 3): experts are
+                            spread over the files in proportion, piece by
+                            piece within each expert (with READ_PIECES a
+                            multiple of the weight sum), so all drives read
+                            each miss at once.
 """
 from __future__ import annotations
 
@@ -39,6 +47,9 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 STREAM_DIR = os.environ.get("VLLM_DS41_STREAM_DIR")
+# VLLM_DS41_STREAM_TIMING=1: host time per streamed MoE call (routing sync,
+# ensure, kernel launch); =2 also syncs after the kernel (GPU time; slower).
+TIMING = int(os.environ.get("VLLM_DS41_STREAM_TIMING", "0") or 0)
 
 
 def enabled() -> bool:
@@ -113,7 +124,22 @@ class StreamCache:
         self.raw = self.lay["raw_bytes"]
         self.device = device
         path = os.path.join(folder, self.lay.get("file", "experts_fp4.bin"))
-        self.fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        files = [(path, int(os.environ.get("VLLM_DS41_STREAM_WEIGHT", "3")))]
+        for m in filter(None, os.environ.get("VLLM_DS41_STREAM_MIRRORS", "").split(",")):
+            d, _, wt = m.rpartition(":")
+            files.append((os.path.join(d, self.lay.get("file", "experts_fp4.bin")), int(wt)))
+        self.fds = [os.open(p, os.O_RDONLY | os.O_DIRECT) for p, _ in files]
+        # expert index -> file: smooth weighted round-robin over the files
+        # (weights 3,1 -> 0,0,1,0), so neighbouring experts use different drives
+        wts = [wt for _, wt in files]
+        cur = [0] * len(files)
+        self.pattern = []
+        for _ in range(sum(wts)):
+            cur = [c + w for c, w in zip(cur, wts)]
+            j = max(range(len(files)), key=lambda i: cur[i])
+            cur[j] -= sum(wts)
+            self.pattern.append(j)
+        self.fd = self.fds[0]
         slots = int(os.environ.get("VLLM_DS41_STREAM_SLOTS", "0") or 0)
         if slots > 0:
             n_slots = slots * n_layers
@@ -138,6 +164,7 @@ class StreamCache:
         self.pieces = [(p, min(self.piece, self.raw - p)) for p in range(0, self.raw, self.piece)]
         self.q: list = []                       # heap of (prio, seq, fetch, piece)
         self.qlock = threading.Condition()
+        self.done_cv = threading.Condition()     # readers notify on each finished fetch
         self.seq = 0
         self.pf_round = 0
         self.stats = dict(hits=0, misses=0, pf_issued=0, pf_used=0, pf_dropped=0,
@@ -146,7 +173,8 @@ class StreamCache:
         for _ in range(self.n_threads):
             threading.Thread(target=self._reader, daemon=True).start()
         logger.info("DeepSeek V4.1 expert streaming: %s, %d slots (%.1f per layer, %.1f GiB) "
-                    "on %s, %d reader threads, %d %s staging buffers", path, n_slots,
+                    "on %s, %d reader threads, %d %s staging buffers", ",".join(
+                        f"{p}x{wt}" for p, wt in files), n_slots,
                     n_slots / n_layers, n_slots * self.raw / 2**30, device, self.n_threads,
                     len(self.staging.bufs), "pinned" if self.staging.pinned else "pageable")
 
@@ -201,11 +229,16 @@ class StreamCache:
             try:
                 p0, n = self.pieces[k]
                 l, e = f.key
-                off = (l * self.E + e) * self.block + p0
+                gi = l * self.E + e
+                # Stripe within the expert: its pieces are spread over the
+                # files by weight (RAID-0 like), so one miss reads from all
+                # drives at once and the slower drive never straggles.
+                fd = self.fds[self.pattern[(k + gi) % len(self.pattern)]]
+                off = gi * self.block + p0
                 want = (n + 4095) & ~4095
                 got = 0
                 while got < want:
-                    r = os.preadv(self.fd, [mv[got:want]], off + got)
+                    r = os.preadv(fd, [mv[got:want]], off + got)
                     if r <= 0:
                         raise OSError(f"short read at expert {f.key}")
                     got += r
@@ -215,8 +248,11 @@ class StreamCache:
                 f.err = ex
             with self.qlock:
                 f.left -= 1
-                if f.left == 0:
-                    f.done.set()
+                last = f.left == 0
+            if last:
+                f.done.set()
+                with self.done_cv:
+                    self.done_cv.notify_all()
 
     # ------------------------------------------------------------ device side
     def _alloc_slot(self, protect: set) -> int:
@@ -301,7 +337,9 @@ class StreamCache:
                         self._install(f, protect)
                 if len(rest) == len(pending):
                     self._flush_prefetched(protect)
-                    rest[0].done.wait(0.002)
+                    with self.done_cv:
+                        if not any(f.done.is_set() for f in rest):
+                            self.done_cv.wait(0.05)
                 pending = rest
             torch.xpu.current_stream(self.device).wait_stream(self.copy_stream)
         self._flush_prefetched(protect)
@@ -344,6 +382,24 @@ class StreamCache:
                 continue
             self._submit(k, prio)
             self.stats["pf_issued"] += 1
+
+    _tm = None
+
+    def note_timing(self, T: int, sync_s, ensure_s, launch_s, gpu_s) -> None:
+        """Per-call host times of the streamed MoE (decode steps only)."""
+        if T > 4:
+            return
+        if self._tm is None:
+            self._tm = [0, 0.0, 0.0, 0.0, 0.0, time.time()]
+        tm = self._tm
+        tm[0] += 1; tm[1] += sync_s; tm[2] += ensure_s; tm[3] += launch_s; tm[4] += gpu_s
+        if tm[0] % 4000 == 0:
+            n = tm[0]
+            logger.info("expert stream timing: %d calls, per call ms: routing sync %.3f, "
+                        "ensure %.3f, kernel launch %.3f, kernel run (sync) %.3f; "
+                        "%.1f calls/s", n, 1e3 * tm[1] / n, 1e3 * tm[2] / n, 1e3 * tm[3] / n,
+                        1e3 * tm[4] / n, n / (time.time() - tm[5]))
+            self._tm = None
 
     def parts(self, layer: int, e: int):
         from .fp4_moe import expert_parts
