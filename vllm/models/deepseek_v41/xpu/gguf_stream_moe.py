@@ -75,6 +75,41 @@ def _gemv_slot_kernel(x_ptr, w_ptr, sidx_ptr, y_ptr, grid64_ptr, sign_ptr,
 
 
 @triton.jit
+def _w2_fused_kernel(h_ptr, wts_ptr, w_ptr, sidx_ptr, out_ptr, grid64_ptr, sign_ptr,
+                     H, I, row_bytes, slot_stride, limit,
+                     K_TOP: tl.constexpr, HAS_LIMIT: tl.constexpr, QTYPE: tl.constexpr,
+                     BB: tl.constexpr, BLOCK_N: tl.constexpr):
+    """out[t, rows] += sum_j W2[slot(t, j)] @ (silu(min(g, L)) * clamp(u) * w[t, j]),
+    h[p] = [g | u] fp32 [P, 2I], p = t * K_TOP + j. One launch replaces swiglu,
+    the split-K GEMV, both sums and the add."""
+    t = tl.program_id(0)
+    rows = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < H
+    rows = tl.where(rmask, rows, 0)
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    xo = tl.arange(0, 32)[:, None] * 8 + tl.arange(0, 8)[None, :]
+    n_kb = I // 256
+    for j in range(K_TOP):
+        p = t * K_TOP + j
+        s = tl.load(sidx_ptr + p)
+        if s >= 0:
+            wt = tl.load(wts_ptr + p).to(tl.float32)
+            row_base = w_ptr + s.to(tl.int64) * slot_stride + rows.to(tl.int64) * row_bytes
+            hb = h_ptr + p.to(tl.int64) * 2 * I
+            for kb in range(n_kb):
+                g = tl.load(hb + kb * 256 + xo)
+                u = tl.load(hb + I + kb * 256 + xo)
+                if HAS_LIMIT:
+                    g = tl.minimum(g, limit)
+                    u = tl.minimum(tl.maximum(u, -limit), limit)
+                a = g / (1.0 + tl.exp(-g)) * u * wt
+                wv = _deq_any((row_base + kb * BB)[:, None], grid64_ptr, sign_ptr, QTYPE)
+                acc += tl.sum(tl.sum(wv * a[None, :, :], axis=2), axis=1)
+    optr = out_ptr + t.to(tl.int64) * H + rows
+    tl.store(optr, tl.load(optr, mask=rmask, other=0.0) + acc, mask=rmask)
+
+
+@triton.jit
 def _dequant_iq_kernel(w_ptr, o_ptr, grid64_ptr, sign_ptr, N, K, row_bytes,
                        QTYPE: tl.constexpr, BB: tl.constexpr, BLOCK_N: tl.constexpr):
     pid_n = tl.program_id(0)
@@ -158,6 +193,9 @@ def dequant(raw: torch.Tensor, N: int, K: int, qtype: int, dtype=torch.bfloat16)
 _SYCL = __import__("os").environ.get("VLLM_DS41_MOE_SYCL", "1") == "1"
 _ROWS = int(__import__("os").environ.get("VLLM_DS41_MOE_ROWS", "4"))
 _sycl_cache: dict = {}
+# rows per program of the fused w2 kernel (0: old swiglu + split-K path)
+_FUSED_W2 = int(__import__("os").environ.get("VLLM_DS41_FUSED_W2", "8"))
+_FUSED_W2_WARPS = int(__import__("os").environ.get("VLLM_DS41_FUSED_W2_WARPS", "2"))
 
 
 def _sycl_ok(qtype: int) -> bool:
@@ -177,7 +215,7 @@ def moe_decode_gguf(x, idx, w, out, pool, slot_row, lay, limit):
     T, k = idx.shape
     H, I = lay["hidden"], lay["inter"]
     o, qt, rb = lay["offsets"], lay["qtypes"], lay["row_bytes"]
-    sidx = slot_row.index_select(0, idx.reshape(-1).long()).contiguous()
+    sidx = slot_row.index_select(0, idx.reshape(-1))
     P = T * k
     if _sycl_ok(qt["w13"]):
         # llama.cpp-style SYCL GEMV (q8_1 activations), as the live GGUF build;
@@ -195,6 +233,14 @@ def moe_decode_gguf(x, idx, w, out, pool, slot_row, lay, limit):
     else:
         h = gemv_slots(x.contiguous(), pool, sidx, 2 * I, H, o["w13_weight"], rb["w13"],
                        qt["w13"], k)
+    if _FUSED_W2 and out.dtype == torch.float32 and out.is_contiguous():
+        g64, sg = _tables(x.device, qt["w2"])
+        _w2_fused_kernel[(T, triton.cdiv(H, _FUSED_W2))](
+            h, w.reshape(-1), pool[:, o["w2_weight"]:], sidx, out, g64, sg,
+            H, I, rb["w2"], pool.stride(0), float(limit or 0.0),
+            K_TOP=k, HAS_LIMIT=bool(limit), QTYPE=qt["w2"], BB=BLOCK_BYTES[qt["w2"]],
+            BLOCK_N=_FUSED_W2, num_warps=_FUSED_W2_WARPS)
+        return
     a = torch.empty(P, I, dtype=torch.float32, device=x.device)
     _swiglu_w_kernel[(P, triton.cdiv(I, 1024))](
         h, w.reshape(-1).float().contiguous(), a, I, float(limit or 0.0),

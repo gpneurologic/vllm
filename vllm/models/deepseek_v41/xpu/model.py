@@ -92,6 +92,9 @@ _STREAM_GEMV_MAX_T = int(os.environ.get("VLLM_DS41_STREAM_GEMV_MAX_T", "16"))
 # queued as low-priority reads, so they overlap this layer's wait and compute.
 _LOOKAHEAD = int(os.environ.get("VLLM_DS41_LOOKAHEAD", "0"))
 _LOOKAHEAD_EXTRA = int(os.environ.get("VLLM_DS41_LOOKAHEAD_EXTRA", "2"))
+_ASYNC = os.environ.get("VLLM_DS41_STREAM_ASYNC", "1") == "1"
+_ASYNC_CHECK = os.environ.get("VLLM_DS41_STREAM_ASYNC_CHECK", "0") == "1"
+_ASYNC_STATS = {"n": 0, "miss": 0, "max": 0.0, "bad": 0}
 _STREAM_MOES: dict = {}  # layer id -> XpuOffloadMoE (main layers)
 
 
@@ -330,6 +333,9 @@ class XpuOffloadMoE(nn.Module):
                 if nm is None:
                     break
                 nexts.append(nm)
+        if _ASYNC and not nexts and T <= _STREAM_GEMV_MAX_T:
+            self._forward_stream_async(x, idx, w, out, tm, t0)
+            return
         if nexts:
             # one host transfer for this layer's routing and the predictions
             kp = self.topk + _LOOKAHEAD_EXTRA
@@ -387,10 +393,106 @@ class XpuOffloadMoE(nn.Module):
                                    w[rows, slot, None])
                 out.index_add_(0, rows, y)
 
+    def _check_async(self, x, idx, w, out, before, cache, decode, had_miss) -> None:
+        """VLLM_DS41_STREAM_ASYNC_CHECK=1: redo the call the synchronous way
+        (full slot row after ensure) and log the worst relative difference."""
+        ref = torch.zeros_like(out)
+        decode(x, idx, w, ref, cache.pool, cache.slot_dev[self.layer_id], cache.lay,
+               self.swiglu_limit)
+        d = ((out - before) - ref).abs().max().item()
+        m = max(ref.abs().max().item(), 1e-6)
+        st = _ASYNC_STATS
+        st["n"] += 1
+        st["miss"] += bool(had_miss)
+        st["max"] = max(st["max"], d / m)
+        st["bad"] += d / m > 1e-2
+        if st["n"] % 2000 == 0:
+            logger.info("async check: %d calls (%d with misses), max rel diff %.2e, %d over 1e-2",
+                        st["n"], st["miss"], st["max"], st["bad"])
+
+    def _forward_stream_async(self, x, idx, w, out, tm, t0) -> None:
+        """Decode without waiting for the routing first: launch the expert
+        kernels on the device slot table (experts not resident read slot -1 and
+        add nothing), copy the routing to the host meanwhile, then fetch any
+        missing experts and add their pairs in a top-up pass."""
+        cache = expert_stream.StreamCache.get(x.device, self.n_layers)
+        if cache.lay.get("format", "").startswith("ds41-gguf"):
+            from .gguf_stream_moe import moe_decode_gguf as decode
+        else:
+            from .fp4_moe import moe_decode_fp4 as decode
+        cache.sync_table()
+        before = out.clone() if _ASYNC_CHECK else None
+        hb = cache.idx_host(idx.numel(), idx.dtype)
+        hb.copy_(idx.reshape(-1), non_blocking=True)
+        ev = torch.xpu.Event()
+        ev.record()
+        with prof.section("routed_moe"):
+            decode(x, idx, w, out, cache.pool, cache.slot_dev[self.layer_id], cache.lay,
+                   self.swiglu_limit)
+        t1 = time.perf_counter() if tm else 0.0
+        ev.synchronize()
+        lo, hi = self.e_start, self.e_start + self.n_local
+        experts = sorted({v for v in hb.tolist() if lo <= v < hi})
+        t2 = time.perf_counter() if tm else 0.0
+        miss: list = []
+        if experts:
+            miss = [e for e in experts if (self.layer_id, e) not in cache.lru]
+            with prof.section("expert_fetch"):
+                cache.ensure(self.layer_id, experts)
+            if miss:
+                with prof.section("routed_moe"):
+                    decode(x, idx, w, out, cache.pool, cache.fix_row(self.layer_id, miss),
+                           cache.lay, self.swiglu_limit)
+        if _ASYNC_CHECK:
+            self._check_async(x, idx, w, out, before, cache, decode, miss)
+        if tm:
+            # columns: routing wait, ensure + top-up, launch, 0
+            cache.note_timing(x.shape[0], t2 - t1, time.perf_counter() - t2, t1 - t0, 0.0)
+
 
 @eager_break_during_capture
 def _stream_moe(x, idx, w, out, moe) -> None:
     moe._forward_stream(x, idx, w, out)
+
+
+def _time_graph_replay() -> None:
+    """VLLM_DS41_STREAM_TIMING=3: host time per breakable-graph replay, split
+    into graph-segment submits and eager segments (logged every 500 steps)."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture as C
+
+    if getattr(C.replay, "_ds41_timed", False):
+        return
+    st = [0, 0, 0.0, 0.0, 0.0]  # steps, segments, graph s, eager s, total s
+
+    def replay(self) -> None:
+        t0 = time.perf_counter()
+        tg = te = 0.0
+        for r in self.segments:
+            a = time.perf_counter()
+            r()
+            d = time.perf_counter() - a
+            if getattr(r, "__self__", None) is not None:
+                tg += d
+            else:
+                te += d
+        st[0] += 1
+        st[1] += len(self.segments)
+        st[2] += tg
+        st[3] += te
+        st[4] += time.perf_counter() - t0
+        if st[0] % 500 == 0:
+            n = st[0]
+            logger.info("graph replay: %d steps, %.1f segments/step, per step ms: "
+                        "graph submit %.2f, eager %.2f, total %.2f", n, st[1] / n,
+                        st[2] / n * 1e3, st[3] / n * 1e3, st[4] / n * 1e3)
+            st[:] = [0, 0, 0.0, 0.0, 0.0]
+
+    replay._ds41_timed = True
+    C.replay = replay
+
+
+if expert_stream.TIMING == 3:
+    _time_graph_replay()
 
 
 class DeepseekV4DecoderLayer(nn.Module):

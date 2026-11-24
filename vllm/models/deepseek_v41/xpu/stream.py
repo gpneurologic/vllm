@@ -364,6 +364,37 @@ class StreamCache:
         self._maybe_log()
         return self.slot_dev[layer]
 
+    def sync_table(self) -> None:
+        """Bring every dirty device slot row up to date (stream-ordered), so
+        kernels launched before the host sees the routing read valid slots."""
+        if self._dirty:
+            if len(self._dirty) > 4:
+                self.slot_dev.copy_(self.slot_cpu)
+            else:
+                for layer in self._dirty:
+                    self.slot_dev[layer].copy_(self.slot_cpu[layer])
+            self._dirty.clear()
+
+    def idx_host(self, n: int, dtype) -> torch.Tensor:
+        """Pinned host buffer for a layer's routing ids (reused; callers wait
+        on the copy before the next use)."""
+        b = getattr(self, "_ih", None)
+        if b is None or b.numel() < n or b.dtype != dtype:
+            try:
+                b = torch.empty(max(n, 256), dtype=dtype, pin_memory=True)
+            except RuntimeError:
+                b = torch.empty(max(n, 256), dtype=dtype)
+            self._ih = b
+        return b[:n]
+
+    def fix_row(self, layer: int, experts: list[int]) -> torch.Tensor:
+        """Device slot row holding only `experts` (others -1): a top-up pass
+        for the pairs whose experts were missing at launch."""
+        r = torch.full((self.E,), -1, dtype=torch.int32)
+        for e in experts:
+            r[e] = int(self.slot_cpu[layer, e])
+        return r.to(self.device)
+
     def _make_room(self, protect: set) -> None:
         """Free a staging buffer for a demand read: install landed prefetches,
         cancel queued ones, wait for a started one to finish."""
