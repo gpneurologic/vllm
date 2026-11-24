@@ -65,6 +65,7 @@ from . import alloc_trim, expert_stats, prof
 from .mhc_xpu import XpuMHCPreDelayed
 from .gguf_loader import GgufEngramEmbedding, gguf_path, load_expert_slice, run_gguf_experts
 from .offload import DiskEngramEmbedding, ExpertCache, run_expert
+from . import stream as expert_stream
 
 logger = init_logger(__name__)
 _DEBUG = __import__("os").environ.get("VLLM_DS41_DEBUG") == "1"
@@ -81,6 +82,9 @@ _ROUTER_F32_CACHE = __import__("os").environ.get("VLLM_DS41_ROUTER_F32_CACHE") =
 # Reduce the MoE output in bf16 instead of fp32 for steps of at least this
 # many tokens (0 = always fp32; default 64: prefill only).
 _AR_BF16_MIN_T = int(os.environ.get("VLLM_DS41_AR_BF16_MIN_T", "64"))
+# Streamed experts (VLLM_DS41_STREAM_DIR): steps of at most this many tokens use
+# the batched FP4 decode kernel; longer steps run expert by expert.
+_STREAM_GEMV_MAX_T = int(os.environ.get("VLLM_DS41_STREAM_GEMV_MAX_T", "16"))
 
 
 def _expert_range(n_routed: int, tp: int, rank: int, layer: int) -> tuple[int, int]:
@@ -184,6 +188,8 @@ class XpuOffloadMoE(nn.Module):
         self.route_scale = config.routed_scaling_factor
         self.swiglu_limit = float(config.swiglu_limit or 0.0)
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.n_layers = config.num_hidden_layers
+        self.layer_id = int(self.prefix_ckpt.split(".")[1])
         self.e_start, self.n_local = _expert_range(
             self.n_routed, self.tp_size, get_tensor_model_parallel_rank(),
             int(self.prefix_ckpt.split(".")[1]))
@@ -257,6 +263,8 @@ class XpuOffloadMoE(nn.Module):
                 with prof.section("routed_moe"):
                     run_gguf_experts(x, idx, w, out, self.w13, self.w2, self.t13, self.t2,
                                      self.e_start, self.n_local, self.swiglu_limit)
+        elif x.shape[0] > 0 and real_step and expert_stream.enabled():
+            self._forward_stream(x, idx, w, out)
         elif x.shape[0] > 0 and real_step:
             local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
             experts = torch.unique(idx[local]).tolist()
@@ -281,6 +289,30 @@ class XpuOffloadMoE(nn.Module):
                     return tensor_model_parallel_all_reduce(out.to(x.dtype))
                 out = tensor_model_parallel_all_reduce(out)
         return out.to(x.dtype)
+
+
+    def _forward_stream(self, x, idx, w, out) -> None:
+        local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
+        experts = torch.unique(idx[local]).tolist()
+        if not experts:
+            return
+        cache = expert_stream.StreamCache.get(x.device, self.n_layers)
+        with prof.section("expert_fetch"):
+            slot_row = cache.ensure(self.layer_id, experts)
+        with prof.section("routed_moe"):
+            if x.shape[0] <= _STREAM_GEMV_MAX_T:
+                from .fp4_moe import moe_decode_fp4
+
+                moe_decode_fp4(x, idx, w, out, cache.pool, slot_row, cache.lay,
+                               self.swiglu_limit)
+                return
+            for e in experts:
+                rows, slot = torch.where(idx == e)
+                out.index_add_(
+                    0, rows,
+                    run_expert(x[rows], cache.parts(self.layer_id, e), self.swiglu_limit,
+                               w[rows, slot, None]),
+                )
 
 
 class DeepseekV4DecoderLayer(nn.Module):

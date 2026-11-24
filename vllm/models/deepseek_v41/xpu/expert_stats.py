@@ -43,7 +43,11 @@ def step() -> None:
 # saved as <dir>/trace_<n>.pt. Used offline (tools/ds41_route_stats.py) to
 # size expert streaming: reuse between tokens, cache hit rates, bytes/token.
 # Graph-captured steps are not traced: run with --enforce-eager. Off: no cost.
+# VLLM_DS41_ROUTE_TRACE_SCORES=1 also saves this layer's full biased router
+# scores (fp16 [T, n_experts]) for steps of at most 4 tokens (decode), to test
+# next-token predictors (row element 6; None otherwise).
 TRACE = os.environ.get("VLLM_DS41_ROUTE_TRACE")
+_SCORES = os.environ.get("VLLM_DS41_ROUTE_TRACE_SCORES") == "1"
 _gates: dict[int, torch.nn.Module] = {}
 _trace: dict = {"fwd": 0, "chunk": 0, "rows": [], "seen_layer": False}
 
@@ -53,9 +57,13 @@ def register_gate(layer: int, gate: torch.nn.Module) -> None:
         _gates[layer] = gate
 
 
-def _predict(gate, x: torch.Tensor, k: int) -> torch.Tensor:
+def _scores(gate, x: torch.Tensor) -> torch.Tensor:
     s = torch.nn.functional.softplus(torch.nn.functional.linear(x.float(), gate.weight.float())).sqrt()
-    return (s + gate.e_score_correction_bias).topk(k, dim=-1)[1]
+    return s + gate.e_score_correction_bias
+
+
+def _predict(gate, x: torch.Tensor, k: int) -> torch.Tensor:
+    return _scores(gate, x).topk(k, dim=-1)[1]
 
 
 def trace(layer: int, x: torch.Tensor, idx: torch.Tensor, real_step: bool) -> None:
@@ -71,7 +79,10 @@ def trace(layer: int, x: torch.Tensor, idx: torch.Tensor, real_step: bool) -> No
         g = _gates.get(layer + j)
         if g is not None:
             preds[j - 1] = _predict(g, x, k).to(torch.int16).cpu()
-    _trace["rows"].append((_trace["fwd"], layer, idx.to(torch.int16).cpu(), preds[0], preds[1]))
+    sc = None
+    if _SCORES and x.shape[0] <= 4 and layer in _gates:
+        sc = _scores(_gates[layer], x).to(torch.float16).cpu()
+    _trace["rows"].append((_trace["fwd"], layer, idx.to(torch.int16).cpu(), preds[0], preds[1], sc))
     _trace["seen_layer"] = True
 
 
