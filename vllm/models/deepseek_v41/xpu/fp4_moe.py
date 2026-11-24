@@ -31,9 +31,24 @@ def _e2m1(c):
 
 
 @triton.jit
+def _fp8_round(xe, xo):
+    """Reference activation rounding, in registers: per group of 32 values
+    (row g of xe / xo, the even / odd halves) a ue8m0 scale from amax / 448,
+    values rounded through fp8 e4m3. Bit-exact with offload.act_fp8_roundtrip."""
+    amax = tl.maximum(tl.maximum(tl.max(tl.abs(xe), axis=1), tl.max(tl.abs(xo), axis=1)), 1e-4)
+    bits = (amax / 448.0).to(tl.int32, bitcast=True)
+    e = ((bits >> 23) & 255) - 127 + tl.where((bits & 0x7FFFFF) != 0, 1, 0)
+    sc = tl.exp2(e.to(tl.float32))[:, None]
+    qe = tl.minimum(tl.maximum(xe / sc, -448.0), 448.0).to(tl.float8e4nv).to(tl.float32) * sc
+    qo = tl.minimum(tl.maximum(xo / sc, -448.0), 448.0).to(tl.float8e4nv).to(tl.float32) * sc
+    return qe, qo
+
+
+@triton.jit
 def _fp4_gemv_kernel(x_ptr, pool_ptr, slot_ptr, idx_ptr, y_ptr,
                      N, K, slot_stride, w_off, s_off, n_pairs,
-                     XDIV: tl.constexpr, BLOCK_N: tl.constexpr, KB_PER: tl.constexpr):
+                     XDIV: tl.constexpr, BLOCK_N: tl.constexpr, KB_PER: tl.constexpr,
+                     QX: tl.constexpr = False):
     """y[pk, p, n] = sum_k W[slot(p)][n, k] * x[p // XDIV, k] over this K split.
     One K block = 256 values = 128 weight bytes = 8 scales."""
     pid_p = tl.program_id(0)
@@ -63,6 +78,8 @@ def _fp4_gemv_kernel(x_ptr, pool_ptr, slot_ptr, idx_ptr, y_ptr,
                 sc = tl.load(srow + kb * 8 + g[None, :]).to(tl.float32)  # [BN,8]
                 xe = tl.load(xrow + kb * 256 + 2 * boff).to(tl.float32)  # [8,16]
                 xo = tl.load(xrow + kb * 256 + 2 * boff + 1).to(tl.float32)
+                if QX:
+                    xe, xo = _fp8_round(xe, xo)
                 lo = _e2m1(wb & 15)
                 hi = _e2m1(wb >> 4)
                 part = tl.sum(lo * xe[None, :, :] + hi * xo[None, :, :], axis=2)  # [BN,8]
@@ -83,21 +100,21 @@ def _swiglu_w_kernel(h_ptr, w_ptr, a_ptr, I, limit, HAS_LIMIT: tl.constexpr,
         g = tl.minimum(g, limit)
         u = tl.minimum(tl.maximum(u, -limit), limit)
     wv = tl.load(w_ptr + p)
-    tl.store(a_ptr + p * I + c, g / (1.0 + tl.exp(-g)) * u * wv, mask=m)
+    tl.store(a_ptr + p * I + c, (g / (1.0 + tl.exp(-g)) * u * wv).to(a_ptr.dtype.element_ty), mask=m)
 
 
 # (BLOCK_N, KB_PER, num_warps) per K: w13 K = 5120 (20 blocks), w2 K = 2304 (9).
 _CFG = {5120: (8, 4, 4), 2304: (8, 3, 4)}
 
 
-def fp4_gemv(x, pool, slot_row, idx_flat, N, K, w_off, s_off, xdiv, cfg=None):
+def fp4_gemv(x, pool, slot_row, idx_flat, N, K, w_off, s_off, xdiv, cfg=None, qx=False):
     P = idx_flat.shape[0]
     bn, kp, nw = cfg or _CFG.get(K, (8, 4, 4))
     split = triton.cdiv(K // 256, kp)
     y = torch.empty(split, P, N, dtype=torch.float32, device=x.device)
     _fp4_gemv_kernel[(P, triton.cdiv(N, bn), split)](
         x, pool, slot_row, idx_flat, y, N, K, pool.stride(0), w_off, s_off, P,
-        XDIV=xdiv, BLOCK_N=bn, KB_PER=kp, num_warps=nw)
+        XDIV=xdiv, BLOCK_N=bn, KB_PER=kp, QX=qx, num_warps=nw)
     return y.sum(0) if split > 1 else y[0]
 
 
@@ -105,6 +122,9 @@ def act_fp8_roundtrip(x: torch.Tensor, block: int = 32) -> torch.Tensor:
     from .offload import act_fp8_roundtrip as f
 
     return f(x, block)
+
+
+_FUSED_Q = __import__("os").environ.get("VLLM_DS41_FP4_FUSED_Q", "1") == "1"
 
 
 def moe_decode_fp4(x, idx, w, out, pool, slot_row, lay, limit):
@@ -115,6 +135,18 @@ def moe_decode_fp4(x, idx, w, out, pool, slot_row, lay, limit):
     H, I = lay["hidden"], lay["inter"]
     o = lay["offsets"]
     idx_flat = idx.reshape(-1).to(torch.int32)
+    if _FUSED_Q:
+        # Activation rounding inside the GEMVs (bit-exact with the unfused path).
+        h = fp4_gemv(x.contiguous(), pool, slot_row, idx_flat, 2 * I, H, o["w13_weight"],
+                     o["w13_scale"], k, qx=True)
+        P = T * k
+        a = torch.empty(P, I, dtype=x.dtype, device=x.device)
+        _swiglu_w_kernel[(P, triton.cdiv(I, 1024))](
+            h, w.reshape(-1).float().contiguous(), a, I, float(limit or 0.0),
+            HAS_LIMIT=bool(limit), BLOCK=1024)
+        y = fp4_gemv(a, pool, slot_row, idx_flat, H, I, o["w2_weight"], o["w2_scale"], 1, qx=True)
+        out += y.view(T, k, H).sum(1)
+        return
     xq = act_fp8_roundtrip(x).contiguous()
     h = fp4_gemv(xq, pool, slot_row, idx_flat, 2 * I, H, o["w13_weight"], o["w13_scale"], k)
     P = T * k

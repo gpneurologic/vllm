@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -263,8 +264,11 @@ class XpuOffloadMoE(nn.Module):
                 with prof.section("routed_moe"):
                     run_gguf_experts(x, idx, w, out, self.w13, self.w2, self.t13, self.t2,
                                      self.e_start, self.n_local, self.swiglu_limit)
-        elif x.shape[0] > 0 and real_step and expert_stream.enabled():
-            self._forward_stream(x, idx, w, out)
+        elif x.shape[0] > 0 and expert_stream.enabled():
+            # Eager segment between graph segments (breakable graphs): host
+            # side cache work and NVMe reads; writes into `out` in place. The
+            # real-step check runs inside, at replay time.
+            _stream_moe(x, idx, w, out, self)
         elif x.shape[0] > 0 and real_step:
             local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
             experts = torch.unique(idx[local]).tolist()
@@ -292,6 +296,9 @@ class XpuOffloadMoE(nn.Module):
 
 
     def _forward_stream(self, x, idx, w, out) -> None:
+        if not (is_forward_context_available()
+                and isinstance(get_forward_context().attn_metadata, dict)):
+            return  # memory profile / warm-up pass: no expert reads
         local = (idx >= self.e_start) & (idx < self.e_start + self.n_local)
         experts = torch.unique(idx[local]).tolist()
         if not experts:
@@ -313,6 +320,11 @@ class XpuOffloadMoE(nn.Module):
                     run_expert(x[rows], cache.parts(self.layer_id, e), self.swiglu_limit,
                                w[rows, slot, None]),
                 )
+
+
+@eager_break_during_capture
+def _stream_moe(x, idx, w, out, moe) -> None:
+    moe._forward_stream(x, idx, w, out)
 
 
 class DeepseekV4DecoderLayer(nn.Module):

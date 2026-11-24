@@ -129,10 +129,14 @@ class StreamCache:
         self._dirty: set = set()                # layers whose slot row changed
         self.free_slots = list(range(n_slots - 1, -1, -1))
         self.inflight: dict = {}                # (layer, e) -> _Fetch
+        self._zombies: list = []                # cancelled fetches still holding a buffer
         self.copy_stream = torch.xpu.Stream(device)
         self.staging = _Staging(int(os.environ.get("VLLM_DS41_STAGING", "32")), self.block)
         self.n_threads = int(os.environ.get("VLLM_DS41_READ_THREADS", "16"))
-        self.q: list = []                       # heap of (prio, seq, key, fetch)
+        n_pc = max(1, int(os.environ.get("VLLM_DS41_READ_PIECES", "8")))
+        self.piece = ((self.raw + n_pc - 1) // n_pc + 4095) & ~4095
+        self.pieces = [(p, min(self.piece, self.raw - p)) for p in range(0, self.raw, self.piece)]
+        self.q: list = []                       # heap of (prio, seq, fetch, piece)
         self.qlock = threading.Condition()
         self.seq = 0
         self.pf_round = 0
@@ -147,61 +151,72 @@ class StreamCache:
                     len(self.staging.bufs), "pinned" if self.staging.pinned else "pageable")
 
     # ------------------------------------------------------------- reader side
+    # A fetch is split into pieces (VLLM_DS41_READ_PIECES, default 8) read by
+    # different threads: a lone miss then uses the drive's parallelism
+    # instead of one queue-depth-1 read. Each piece is read with O_DIRECT into
+    # the thread's anonymous buffer (O_DIRECT cannot target the runtime's
+    # pinned memory: EFAULT) and copied into the fetch's pinned staging
+    # buffer. The staging buffer is taken when the fetch is submitted (main
+    # thread); ensure() never has more fetches in flight than buffers.
     class _Fetch:
-        __slots__ = ("key", "prio", "round", "done", "buf", "err", "started", "cancel")
+        __slots__ = ("key", "prio", "round", "done", "buf", "err", "started", "cancel", "left",
+                     "installed")
 
-        def __init__(self, key, prio, rnd):
+        def __init__(self, key, prio, rnd, n):
             self.key, self.prio, self.round = key, prio, rnd
             self.done = threading.Event()
             self.buf = None
             self.err = None
             self.started = False
             self.cancel = False
+            self.left = n
+            self.installed = False
 
     def _submit(self, key, prio: int):
-        f = self._Fetch(key, prio, self.pf_round)
+        f = self._Fetch(key, prio, self.pf_round, len(self.pieces))
+        f.buf = self.staging.get()
         with self.qlock:
-            self.seq += 1
-            heapq.heappush(self.q, (prio, self.seq, f))
-            self.qlock.notify()
+            for k in range(len(self.pieces)):
+                self.seq += 1
+                heapq.heappush(self.q, (prio, self.seq, f, k))
+            self.qlock.notify_all()
         self.inflight[key] = f
         return f
 
     def _reader(self) -> None:
-        tls = threading.local()  # one reader loop per thread
+        mm = mmap.mmap(-1, self.piece)
+        mv = memoryview(mm)
+        t = torch.frombuffer(mm, dtype=torch.uint8)
         while True:
             with self.qlock:
                 while not self.q:
                     self.qlock.wait()
-                _, _, f = heapq.heappop(self.q)
+                _, _, f, k = heapq.heappop(self.q)
                 if f.cancel:
-                    f.done.set()
+                    f.left -= 1
+                    if f.left == 0:
+                        f.done.set()
                     continue
                 f.started = True
             try:
-                # O_DIRECT cannot target the runtime's pinned host memory
-                # (EFAULT): read into this thread's anonymous buffer, then
-                # copy into a pinned staging buffer for the async H2D copy.
-                if not hasattr(tls, "mm"):
-                    tls.mm = mmap.mmap(-1, self.block)
-                    tls.mv = memoryview(tls.mm)
-                    tls.t = torch.frombuffer(tls.mm, dtype=torch.uint8)
-                mv = tls.mv
+                p0, n = self.pieces[k]
                 l, e = f.key
-                off = (l * self.E + e) * self.block
+                off = (l * self.E + e) * self.block + p0
+                want = (n + 4095) & ~4095
                 got = 0
-                while got < self.block:
-                    r = os.preadv(self.fd, [mv[got:]], off + got)
+                while got < want:
+                    r = os.preadv(self.fd, [mv[got:want]], off + got)
                     if r <= 0:
                         raise OSError(f"short read at expert {f.key}")
                     got += r
-                i = self.staging.get()
                 with torch.inference_mode():  # the buffers were made in inference mode
-                    self.staging.bufs[i][: self.raw].copy_(tls.t[: self.raw])
-                f.buf = i
+                    self.staging.bufs[f.buf][p0: p0 + n].copy_(t[:n])
             except Exception as ex:  # noqa: BLE001
                 f.err = ex
-            f.done.set()
+            with self.qlock:
+                f.left -= 1
+                if f.left == 0:
+                    f.done.set()
 
     # ------------------------------------------------------------ device side
     def _alloc_slot(self, protect: set) -> int:
@@ -218,11 +233,16 @@ class StreamCache:
     def _install(self, f, protect: set) -> None:
         """Copy a finished read into a slot (copy stream)."""
         f.done.wait()
-        self.inflight.pop(f.key, None)
+        if f.installed:
+            return
+        f.installed = True
+        if self.inflight.get(f.key) is f:
+            del self.inflight[f.key]
         if f.err is not None:
             raise f.err
-        if f.buf is None:
-            return  # cancelled
+        if f.cancel:
+            self.staging.release(f.buf)
+            return
         slot = self._alloc_slot(protect)
         src = self.staging.bufs[f.buf][: self.raw]
         with torch.xpu.stream(self.copy_stream):
@@ -252,33 +272,34 @@ class StreamCache:
             else:
                 need.append(k)
         if need:
-            fetches = []
-            for k in need:
-                f = self.inflight.get(k)
-                if f is not None:
-                    self.stats["pf_used"] += 1
-                    promote = False
-                    with self.qlock:  # not started yet: re-queue at demand priority
-                        if f.prio > 0 and not f.started:
-                            f.cancel = promote = True
-                    if promote:
+            # At most `cap` fetches in flight (each holds a staging buffer):
+            # long prefill steps miss up to ~128 experts per layer.
+            cap = max(1, len(self.staging.bufs) - 4)
+            todo = list(need)
+            pending: list = []
+            while todo or pending:
+                while todo and len(pending) < cap:
+                    k = todo.pop(0)
+                    f = self.inflight.get(k)
+                    if f is not None:
+                        self.stats["pf_used"] += 1
+                        promote = False
+                        with self.qlock:  # not started yet: re-queue at demand priority
+                            if f.prio > 0 and not f.started:
+                                f.cancel = promote = True
+                        if promote:
+                            self._zombies.append(f)
+                            f = self._submit(k, 0)
+                    else:
+                        self.stats["misses"] += 1
                         f = self._submit(k, 0)
-                else:
-                    self.stats["misses"] += 1
-                    f = self._submit(k, 0)
-                fetches.append(f)
-            # Install in completion order.
-            pending = list(fetches)
-            while pending:
-                rest = []
+                    pending.append(f)
+                # Install in completion order.
+                rest = [f for f in pending if not f.done.is_set()]
                 for f in pending:
                     if f.done.is_set():
                         self._install(f, protect)
-                    else:
-                        rest.append(f)
                 if len(rest) == len(pending):
-                    # Landed prefetches hold staging buffers: install them so
-                    # the readers of the demand misses are never starved.
                     self._flush_prefetched(protect)
                     rest[0].done.wait(0.002)
                 pending = rest
@@ -292,22 +313,34 @@ class StreamCache:
         return self.slot_dev[layer]
 
     def _flush_prefetched(self, protect: set) -> None:
-        """Install prefetches that have landed (no waiting)."""
+        """Install prefetches that have landed (no waiting); free the buffers
+        of cancelled fetches whose pieces have all been dropped."""
+        if self._zombies:
+            for f in [z for z in self._zombies if z.done.is_set()]:
+                self._zombies.remove(f)
+                self.staging.release(f.buf)
         for k, f in list(self.inflight.items()):
             if f.prio > 0 and f.done.is_set():
                 self._install(f, protect)
 
     def prefetch(self, keys: list[tuple[int, int]], prio: int = 1) -> None:
-        """Queue low-priority reads; drops this rank's older prefetches that
-        have not started."""
+        """Queue low-priority reads (only into free staging buffers, keeping a
+        margin for demand reads); drops older prefetches not yet started."""
         self.pf_round += 1
         with self.qlock:
-            for _, _, f in self.q:
-                if f.prio > 0 and not f.started and not f.cancel:
+            old = {id(f): f for _, _, f, _ in self.q if f.prio > 0}
+            for f in old.values():
+                if not f.started and not f.cancel:
                     f.cancel = True
                     self.stats["pf_dropped"] += 1
+        for f in old.values():
+            if f.cancel and self.inflight.get(f.key) is f:
+                del self.inflight[f.key]
+                self._zombies.append(f)
         for k in keys:
-            if k in self.lru or k in self.inflight and not self.inflight[k].cancel:
+            if len(self.staging.free) <= 8:
+                break
+            if k in self.lru or k in self.inflight:
                 continue
             self._submit(k, prio)
             self.stats["pf_issued"] += 1

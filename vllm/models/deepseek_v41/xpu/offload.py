@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -376,7 +377,10 @@ class DiskEngramEmbedding(nn.Module):
         self.cpu_offload = False
         self.packed_fp4 = False
 
+    @eager_break_during_capture
     def lookup(self, hash_ids: torch.Tensor, rows: torch.Tensor, background=False):
+        """Writes into `rows` in place; runs eagerly between graph segments
+        (breakable graphs), since it reads the checkpoint on the host."""
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
         if not (is_forward_context_available()
@@ -391,9 +395,17 @@ class DiskEngramEmbedding(nn.Module):
             rows[:, c:].zero_()
         if c == 0:
             return
-        flat = local.reshape(-1).cpu().numpy()
+        flat = local.reshape(-1).cpu().numpy().astype(np.int64)
+        n_rows = self.files.index[self.wname][4][0]
+        bad = (flat < 0) | (flat >= n_rows)
+        if bad.any():
+            # graph capture runs this once on dummy hashes (zero rows then);
+            # real hashes are always in range
+            flat = np.where(bad, 0, flat)
         vals = self.files.rows(self.wname, flat).to(rows.device)
         sc = self.files.rows(self.sname, flat).to(rows.device)
         v = vals.view(torch.float8_e4m3fn).float().unflatten(-1, (-1, self.block_size))
         v = (v * _e8m0(sc).unsqueeze(-1)).flatten(-2)
+        if bad.any():
+            v[torch.from_numpy(bad).to(v.device)] = 0
         rows[:, :c].copy_(v.view(n, c, self.dim).to(rows.dtype))
