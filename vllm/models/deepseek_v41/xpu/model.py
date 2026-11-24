@@ -318,11 +318,14 @@ class XpuOffloadMoE(nn.Module):
             slot_row = cache.ensure(self.layer_id, experts)
         t2 = time.perf_counter() if tm else 0.0
         with prof.section("routed_moe"):
+            gguf = cache.lay.get("format", "").startswith("ds41-gguf")
             if x.shape[0] <= _STREAM_GEMV_MAX_T:
-                from .fp4_moe import moe_decode_fp4
+                if gguf:
+                    from .gguf_stream_moe import moe_decode_gguf as decode
+                else:
+                    from .fp4_moe import moe_decode_fp4 as decode
 
-                moe_decode_fp4(x, idx, w, out, cache.pool, slot_row, cache.lay,
-                               self.swiglu_limit)
+                decode(x, idx, w, out, cache.pool, slot_row, cache.lay, self.swiglu_limit)
                 if tm:
                     t3 = time.perf_counter()
                     if tm == 2:
@@ -330,13 +333,17 @@ class XpuOffloadMoE(nn.Module):
                     cache.note_timing(x.shape[0], t1 - t0, t2 - t1, t3 - t2,
                                       time.perf_counter() - t3)
                 return
+            if gguf:
+                from .gguf_stream_moe import run_expert_gguf
             for e in experts:
                 rows, slot = torch.where(idx == e)
-                out.index_add_(
-                    0, rows,
-                    run_expert(x[rows], cache.parts(self.layer_id, e), self.swiglu_limit,
-                               w[rows, slot, None]),
-                )
+                if gguf:
+                    y = run_expert_gguf(x[rows], cache.pool, cache.lru[(self.layer_id, e)],
+                                        cache.lay, self.swiglu_limit, w[rows, slot, None])
+                else:
+                    y = run_expert(x[rows], cache.parts(self.layer_id, e), self.swiglu_limit,
+                                   w[rows, slot, None])
+                out.index_add_(0, rows, y)
 
 
 @eager_break_during_capture
