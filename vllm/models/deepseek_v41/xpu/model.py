@@ -477,7 +477,9 @@ class XpuOffloadMoE(nn.Module):
         if experts:
             miss = [e for e in experts if (self.layer_id, e) not in cache.lru]
             with prof.section("expert_fetch"):
+                cache.in_decode = True
                 cache.ensure(self.layer_id, experts)
+                cache.in_decode = False
             if miss:
                 with prof.section("routed_moe"):
                     decode(x, idx, w, out, cache.pool, cache.fix_row(self.layer_id, miss),
@@ -486,7 +488,8 @@ class XpuOffloadMoE(nn.Module):
             self._check_async(x, idx, w, out, before, cache, decode, miss)
         if tm:
             # columns: routing wait, ensure + top-up, launch, 0
-            cache.note_timing(x.shape[0], t2 - t1, time.perf_counter() - t2, t1 - t0, 0.0)
+            cache.note_timing(x.shape[0], t2 - t1, time.perf_counter() - t2, t1 - t0, 0.0,
+                              self.layer_id, len(miss))
 
 
 @eager_break_during_capture
@@ -538,6 +541,8 @@ def _time_graph_replay() -> None:
         d_["total"] += time.perf_counter() - t0
         st["last"] = time.perf_counter()
         st["n"] += 1
+        if prof_at:
+            _profile_tick(st, prof_at)
         if st["n"] % 500 == 0:
             n = st["n"]
             parts = []
@@ -551,12 +556,51 @@ def _time_graph_replay() -> None:
             per.clear()
             st["gap"] = 0.0
 
+    prof_at = None
+    if os.environ.get("VLLM_DS41_PROFILE"):
+        a, _, b = os.environ["VLLM_DS41_PROFILE"].partition(",")
+        prof_at = (int(a), int(b or 20))
     replay._ds41_timed = True
     C.replay = replay
 
 
+def _profile_tick(st: dict, at: tuple) -> None:
+    """VLLM_DS41_PROFILE=start,count: torch profiler (XPU kernels, rank 0) over replays
+    start..start+count; logs kernels by XPU time and saves a Chrome trace in
+    /bench/logs."""
+    n = st["n"]
+    if n == at[0]:
+        from torch.profiler import ProfilerActivity, profile
+
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return  # rank 0 only: the profiler's host memory adds up per worker
+        torch.xpu.synchronize()
+        p = profile(activities=[ProfilerActivity.XPU])
+        p.__enter__()
+        st["prof"], st["prof_t"] = p, time.perf_counter()
+    elif n == at[0] + at[1] and st.get("prof") is not None:
+        torch.xpu.synchronize()
+        wall = time.perf_counter() - st["prof_t"]
+        p = st.pop("prof")
+        p.__exit__(None, None, None)
+        ka = p.key_averages()
+        tot = sum(e.self_device_time_total for e in ka)
+        logger.info("profile: %d replays, wall %.2f ms per replay, XPU kernel time %.2f ms per "
+                    "replay\n%s", at[1], wall / at[1] * 1e3, tot / at[1] / 1e3,
+                    ka.table(sort_by="self_device_time_total", row_limit=45, max_name_column_width=70))
+        del p, ka
+
+
 if expert_stream.TIMING == 3:
     _time_graph_replay()
+
+# VLLM_DS41_PROFILE_EAGER=start,count: the same torch profiler window over eager
+# decode steps (the profiler hangs graph replays on XPU).
+_EAGER_PROF_AT = None
+if os.environ.get("VLLM_DS41_PROFILE_EAGER"):
+    _a, _, _b = os.environ["VLLM_DS41_PROFILE_EAGER"].partition(",")
+    _EAGER_PROF_AT = (int(_a), int(_b or 20))
+_EAGER_PROF_ST: dict = {"n": 0}
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -756,6 +800,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         expert_stats.step()
         expert_stats.trace_step()
         prof.begin_step(positions.shape[0])
+        if _EAGER_PROF_AT and positions.shape[0] <= 4 and not torch.xpu.is_current_stream_capturing():
+            _EAGER_PROF_ST["n"] += 1
+            _profile_tick(_EAGER_PROF_ST, _EAGER_PROF_AT)
         if get_pp_group().is_first_rank:
             hidden_states = (
                 inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)

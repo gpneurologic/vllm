@@ -32,6 +32,7 @@ Settings:
 """
 from __future__ import annotations
 
+import ctypes
 import heapq
 import json
 import mmap
@@ -171,6 +172,34 @@ class StreamCache:
                           pf_hit=0, pf_wasted=0, read_bytes=0, wait_s=0.0, steps=0)
         self.pf_keys: set = set()               # installed by prefetch, not yet demanded
         self._last_log = time.time()
+        self.in_decode = False                  # set by the async decode path (fetch timing)
+        # Demand misses of at most this many experts (VLLM_DS41_SYNC_READ_MAX,
+        # default 0 = off: no decode gain measured) are read by the calling
+        # thread in one preadv (no thread-pool handoff): a lone decode miss
+        # then costs about read + 0.1 ms instead of read + ~1.5 ms.
+        self.sync_max = int(os.environ.get("VLLM_DS41_SYNC_READ_MAX", "0"))
+        self._sync_mm = mmap.mmap(-1, (self.block + 4095) & ~4095) if self.sync_max > 0 else None
+        self._sync_t = torch.frombuffer(self._sync_mm, dtype=torch.uint8) if self._sync_mm else None
+        # How the main-thread read reaches VRAM: "mt" = 4-thread memmove into
+        # pinned staging, then an async copy (workers run torch with 1 thread,
+        # so torch's own host copy of 10 MB takes ~1 ms); "pageable" = copy
+        # straight from the read buffer (driver-staged, synchronous).
+        self.sync_copy = os.environ.get("VLLM_DS41_SYNC_COPY", "mt")
+        self.sync_verify = os.environ.get("VLLM_DS41_SYNC_VERIFY") == "1"
+        self._rows = None
+        self._row_i = 0
+        if os.environ.get("VLLM_DS41_ASYNC_ROWS", "1") == "1":
+            try:
+                self._rows = [torch.empty(self.E, dtype=torch.int32, pin_memory=True) for _ in range(64)]
+            except RuntimeError:
+                self._rows = None
+        self._sync_pool = None
+        if self.sync_max > 0 and self.sync_copy == "mt":
+            from concurrent.futures import ThreadPoolExecutor
+            self._sync_pool = ThreadPoolExecutor(4)
+            self._sync_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._sync_mm))
+            step = ((self.raw + 3) // 4 + 63) & ~63
+            self._sync_jobs = [(o, min(step, self.raw - o)) for o in range(0, self.raw, step)]
         for _ in range(self.n_threads):
             threading.Thread(target=self._reader, daemon=True).start()
         logger.info("DeepSeek V4.1 expert streaming: %s, %d slots (%.1f per layer, %.1f GiB) "
@@ -189,7 +218,7 @@ class StreamCache:
     # thread); ensure() never has more fetches in flight than buffers.
     class _Fetch:
         __slots__ = ("key", "prio", "round", "done", "buf", "err", "started", "cancel", "left",
-                     "installed")
+                     "installed", "t0", "t_start", "t_done")
 
         def __init__(self, key, prio, rnd, n):
             self.key, self.prio, self.round = key, prio, rnd
@@ -200,6 +229,8 @@ class StreamCache:
             self.cancel = False
             self.left = n
             self.installed = False
+            self.t0 = time.perf_counter()
+            self.t_start = self.t_done = 0.0
 
     def _submit(self, key, prio: int):
         f = self._Fetch(key, prio, self.pf_round, len(self.pieces))
@@ -226,6 +257,8 @@ class StreamCache:
                     if f.left == 0:
                         f.done.set()
                     continue
+                if not f.started:
+                    f.t_start = time.perf_counter()
                 f.started = True
             try:
                 p0, n = self.pieces[k]
@@ -251,6 +284,7 @@ class StreamCache:
                 f.left -= 1
                 last = f.left == 0
             if last:
+                f.t_done = time.perf_counter()
                 f.done.set()
                 with self.done_cv:
                     self.done_cv.notify_all()
@@ -283,6 +317,7 @@ class StreamCache:
         if f.cancel:
             self.staging.release(f.buf)
             return
+        t_seen = time.perf_counter()
         slot = self._alloc_slot(protect)
         src = self.staging.bufs[f.buf][: self.raw]
         with torch.xpu.stream(self.copy_stream):
@@ -299,6 +334,13 @@ class StreamCache:
         self.slot_cpu[f.key[0], f.key[1]] = slot
         self._dirty.add(f.key[0])
         self.stats["read_bytes"] += self.block
+        if f.prio == 0 and f.t_done and self.in_decode:
+            s = self.stats
+            s["f_n"] = s.get("f_n", 0) + 1
+            s["f_queue"] = s.get("f_queue", 0.0) + (f.t_start - f.t0)
+            s["f_read"] = s.get("f_read", 0.0) + (f.t_done - f.t_start)
+            s["f_seen"] = s.get("f_seen", 0.0) + (t_seen - f.t_done)
+            s["f_inst"] = s.get("f_inst", 0.0) + (time.perf_counter() - t_seen)
 
     def ensure(self, layer: int, experts: list[int]) -> torch.Tensor:
         """Make `experts` of `layer` resident; returns the layer's device slot
@@ -328,6 +370,14 @@ class StreamCache:
                     self.stats["pf_hit"] += 1
             else:
                 need.append(k)
+        if (need and len(need) <= self.sync_max and len(self.fds) == 1
+                and not any(k in self.inflight for k in need)):
+            for k in need:
+                self._read_sync(k, protect)
+                hits.append(k[1])
+                given.add(k[1])
+            need = []
+            torch.xpu.current_stream(self.device).wait_stream(self.copy_stream)
         if need:
             # At most `cap` fetches in flight (each holds a staging buffer):
             # long prefill steps miss up to ~128 experts per layer.
@@ -387,10 +437,84 @@ class StreamCache:
         yield from hits
         self._flush_prefetched(protect)
         if layer in self._dirty:
-            self.slot_dev[layer].copy_(self.slot_cpu[layer], non_blocking=False)
+            self._row_to_dev(self.slot_dev[layer], self.slot_cpu[layer])
             self._dirty.discard(layer)
         self.stats["wait_s"] += time.time() - t0
         self._maybe_log()
+
+    def _read_sync(self, key, protect: set) -> None:
+        """Read one expert on this thread (one preadv into an aligned buffer,
+        then pinned staging, then an async copy into its slot)."""
+        t0 = time.perf_counter()
+        l, e = key
+        off = (l * self.E + e) * self.block
+        mv = memoryview(self._sync_mm)
+        want = (self.block + 4095) & ~4095
+        got = 0
+        while got < want:
+            r = os.preadv(self.fds[0], [mv[got:want]], off + got)
+            if r <= 0:
+                raise OSError(f"short read at expert {key}")
+            got += r
+        t1 = time.perf_counter()
+        slot = self._alloc_slot(protect)
+        if self.sync_copy == "pageable":
+            with torch.xpu.stream(self.copy_stream):
+                self.pool[slot].copy_(self._sync_t[: self.raw])
+            self.copy_stream.synchronize()  # the read buffer is reused next call
+        else:
+            buf = self.staging.get()
+            src = self.staging.bufs[buf][: self.raw]
+            if self._sync_pool is not None:
+                # torch runs with 1 thread in the workers: split the host copy
+                # over 4 threads (ctypes.memmove releases the GIL)
+                d0 = src.data_ptr()
+                list(self._sync_pool.map(
+                    lambda j: ctypes.memmove(d0 + j[0], self._sync_addr + j[0], j[1]),
+                    self._sync_jobs))
+            else:
+                src.copy_(self._sync_t[: self.raw])
+            with torch.xpu.stream(self.copy_stream):
+                self.pool[slot].copy_(src, non_blocking=self.staging.pinned)
+                ev = torch.xpu.Event()
+                ev.record(self.copy_stream)
+            if self.staging.pinned:
+                self.staging.release_after(buf, ev)
+            else:
+                self.staging.release(buf)
+        if self.sync_verify:
+            # test mode: the slot must hold exactly the bytes read from the drive
+            self.copy_stream.synchronize()
+            ok = torch.equal(self.pool[slot].cpu(), self._sync_t[: self.raw])
+            self.stats["v_n"] = self.stats.get("v_n", 0) + 1
+            self.stats["v_bad"] = self.stats.get("v_bad", 0) + (not ok)
+            if not ok or self.stats["v_n"] % 500 == 0:
+                logger.info("sync read verify: %d checked, %d wrong (last %s %s)",
+                            self.stats["v_n"], self.stats["v_bad"], key, "ok" if ok else "WRONG")
+        self.lru[key] = slot
+        self.slot_cpu[l, e] = slot
+        self._dirty.add(l)
+        s = self.stats
+        s["misses"] += 1
+        s["read_bytes"] += self.block
+        if self.in_decode:
+            s["s_n"] = s.get("s_n", 0) + 1
+            s["s_read"] = s.get("s_read", 0.0) + (t1 - t0)
+            s["s_rest"] = s.get("s_rest", 0.0) + (time.perf_counter() - t1)
+
+    def _row_to_dev(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        """Slot-table row to the device. A plain copy from pageable memory makes
+        the host wait for the stream to drain; with VLLM_DS41_ASYNC_ROWS=1 (default) the row
+        goes through a ring of pinned buffers instead (stream-ordered, no host
+        wait). A ring entry is reused 64 rows later, long after its copy ran:
+        every MoE call waits for its routing, which follows earlier copies."""
+        if self._rows is None:
+            dst.copy_(src)
+            return
+        b = self._rows[self._row_i % len(self._rows)]
+        self._row_i += 1
+        b.copy_(src)
+        dst.copy_(b, non_blocking=True)
 
     def wait_copies(self) -> None:
         """Order the current stream after every slot copy issued so far."""
@@ -404,7 +528,7 @@ class StreamCache:
                 self.slot_dev.copy_(self.slot_cpu)
             else:
                 for layer in self._dirty:
-                    self.slot_dev[layer].copy_(self.slot_cpu[layer])
+                    self._row_to_dev(self.slot_dev[layer], self.slot_cpu[layer])
             self._dirty.clear()
 
     def idx_host(self, n: int, dtype) -> torch.Tensor:
@@ -425,7 +549,11 @@ class StreamCache:
         r = torch.full((self.E,), -1, dtype=torch.int32)
         for e in experts:
             r[e] = int(self.slot_cpu[layer, e])
-        return r.to(self.device)
+        if self._rows is None:
+            return r.to(self.device)
+        d = torch.empty(self.E, dtype=torch.int32, device=self.device)
+        self._row_to_dev(d, r)
+        return d
 
     def _make_room(self, protect: set) -> None:
         """Free a staging buffer for a demand read: install landed prefetches,
@@ -481,20 +609,33 @@ class StreamCache:
 
     _tm = None
 
-    def note_timing(self, T: int, sync_s, ensure_s, launch_s, gpu_s) -> None:
-        """Per-call host times of the streamed MoE (decode steps only)."""
+    def note_timing(self, T: int, sync_s, ensure_s, launch_s, gpu_s, layer: int = -1,
+                    nmiss: int = 0) -> None:
+        """Per-call host times of the streamed MoE (decode steps only), split
+        by whether the call had to read experts, plus misses per layer."""
         if T > 4:
             return
         if self._tm is None:
-            self._tm = [0, 0.0, 0.0, 0.0, 0.0, time.time()]
+            self._tm = [0, 0.0, 0.0, 0.0, 0.0, time.time(), 0, 0.0, 0]
+            self._tm_layer = [0] * self.L
         tm = self._tm
         tm[0] += 1; tm[1] += sync_s; tm[2] += ensure_s; tm[3] += launch_s; tm[4] += gpu_s
+        if nmiss:
+            tm[6] += 1; tm[7] += ensure_s; tm[8] += nmiss
+            if 0 <= layer < self.L:
+                self._tm_layer[layer] += nmiss
         if tm[0] % 4000 == 0:
             n = tm[0]
+            nm = max(tm[6], 1)
+            nh = max(n - tm[6], 1)
             logger.info("expert stream timing: %d calls, per call ms: routing sync %.3f, "
                         "ensure %.3f, kernel launch %.3f, kernel run (sync) %.3f; "
                         "%.1f calls/s", n, 1e3 * tm[1] / n, 1e3 * tm[2] / n, 1e3 * tm[3] / n,
                         1e3 * tm[4] / n, n / (time.time() - tm[5]))
+            logger.info("expert stream misses: %.1f%% of calls read experts (%.2f reads each), "
+                        "ensure ms: %.3f with reads, %.3f without; misses per layer: %s",
+                        100 * tm[6] / n, tm[8] / nm, 1e3 * tm[7] / nm,
+                        1e3 * (tm[2] - tm[7]) / nh, ",".join(map(str, self._tm_layer)))
             self._tm = None
 
     def parts(self, layer: int, e: int):
@@ -514,3 +655,12 @@ class StreamCache:
                     len(self.lru), 100.0 * s["hits"] / max(tot, 1), s["hits"], s["misses"],
                     s["pf_used"], s["pf_issued"], s["pf_dropped"], s["pf_hit"], s["pf_wasted"],
                     s["read_bytes"] / 2**30, s["wait_s"])
+        if s.get("s_n"):
+            n = s["s_n"]
+            logger.info("expert sync read ms (decode, %d): read %.3f, staging + copy launch %.3f",
+                        n, 1e3 * s["s_read"] / n, 1e3 * s["s_rest"] / n)
+        if s.get("f_n"):
+            n = s["f_n"]
+            logger.info("expert fetch ms (demand, %d): queued %.3f, read+copy %.3f, landed->noticed "
+                        "%.3f, install %.3f", n, 1e3 * s["f_queue"] / n, 1e3 * s["f_read"] / n,
+                        1e3 * s["f_seen"] / n, 1e3 * s["f_inst"] / n)
