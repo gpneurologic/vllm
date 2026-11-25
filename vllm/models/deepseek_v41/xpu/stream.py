@@ -303,14 +303,26 @@ class StreamCache:
     def ensure(self, layer: int, experts: list[int]) -> torch.Tensor:
         """Make `experts` of `layer` resident; returns the layer's device slot
         row (valid on the current stream once this returns)."""
+        for _ in self.ensure_iter(layer, experts):
+            pass
+        return self.slot_dev[layer]
+
+    def ensure_iter(self, layer: int, experts: list[int]):
+        """As ensure(), but yields each expert id as soon as it is resident:
+        hits at once (after the misses' reads are queued), misses in landing
+        order. Before using a yielded miss, the consumer's stream must wait on
+        copy_stream (wait_copies)."""
         t0 = time.time()
         keys = [(layer, e) for e in experts]
         protect = set(keys)
-        need = []
+        need, hits = [], []
+        given: set = set()  # expert ids already yielded
         for k in keys:
             if k in self.lru:
                 self.lru.move_to_end(k)
                 self.stats["hits"] += 1
+                hits.append(k[1])
+                given.add(k[1])
                 if k in self.pf_keys:
                     self.pf_keys.discard(k)
                     self.stats["pf_hit"] += 1
@@ -344,25 +356,45 @@ class StreamCache:
                         self.stats["misses"] += 1
                         f = self._submit(k, 0)
                     pending.append(f)
+                if hits:  # reads are queued: hand out the resident ones meanwhile
+                    t1 = time.time()
+                    yield from hits
+                    hits = []
+                    t0 += time.time() - t1
                 # Install in completion order.
-                rest = [f for f in pending if not f.done.is_set()]
+                # One snapshot: a read finishing between two checks must not be
+                # both installed now and kept pending (it would be yielded twice).
+                done_now, rest = [], []
                 for f in pending:
-                    if f.done.is_set():
-                        self._install(f, protect)
-                if len(rest) == len(pending):
+                    (done_now if f.done.is_set() else rest).append(f)
+                landed = []
+                for f in done_now:
+                    self._install(f, protect)
+                    if f.key in self.lru and f.key[1] not in given:
+                        given.add(f.key[1])
+                        landed.append(f.key[1])
+                if landed:
+                    t1 = time.time()
+                    yield from landed
+                    t0 += time.time() - t1
+                elif len(rest) == len(pending):
                     self._flush_prefetched(protect)
                     with self.done_cv:
                         if not any(f.done.is_set() for f in rest):
                             self.done_cv.wait(0.05)
                 pending = rest
             torch.xpu.current_stream(self.device).wait_stream(self.copy_stream)
+        yield from hits
         self._flush_prefetched(protect)
         if layer in self._dirty:
             self.slot_dev[layer].copy_(self.slot_cpu[layer], non_blocking=False)
             self._dirty.discard(layer)
         self.stats["wait_s"] += time.time() - t0
         self._maybe_log()
-        return self.slot_dev[layer]
+
+    def wait_copies(self) -> None:
+        """Order the current stream after every slot copy issued so far."""
+        torch.xpu.current_stream(self.device).wait_stream(self.copy_stream)
 
     def sync_table(self) -> None:
         """Bring every dirty device slot row up to date (stream-ordered), so

@@ -158,11 +158,42 @@ class CheckpointFiles:
         del mv
         return torch.frombuffer(mm, dtype=torch.uint8), a0
 
-    def rows(self, name: str, row_ids: np.ndarray) -> torch.Tensor:
+    def table(self, name: str) -> np.ndarray:
+        """[rows, row_bytes] uint8 view of a tensor in the mmap."""
         f, off, nb, dt, shape = self.index[name]
-        width = nb // shape[0]
         arr = np.frombuffer(self.maps[f], dtype=np.uint8, count=nb, offset=off)
-        return torch.from_numpy(arr.reshape(shape[0], width)[row_ids])
+        return arr.reshape(shape[0], nb // shape[0])
+
+    def rows(self, name: str, row_ids: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(self.table(name)[row_ids])
+
+
+# Engram rows are random reads from ~94 GB tables that do not fit in RAM; each
+# row is a page fault (an NVMe read). One thread waits on each in turn
+# (~0.2-0.3 ms each on the Gen4 drive); a pool overlaps them.
+_ENGRAM_THREADS = int(os.environ.get("VLLM_DS41_ENGRAM_THREADS", "64"))
+_engram_pool = None
+
+
+def gather_rows(jobs: list) -> list:
+    """[(table [N, W], idx)] -> [table[idx]], all tables gathered at once by a
+    thread pool (np.take releases the GIL while it page-faults)."""
+    global _engram_pool
+    if _ENGRAM_THREADS <= 1:
+        return [t[i] for t, i in jobs]
+    if _engram_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _engram_pool = ThreadPoolExecutor(_ENGRAM_THREADS, thread_name_prefix="ds41-engram")
+    outs, parts = [], []
+    per = max(1, (sum(len(i) for _, i in jobs) + _ENGRAM_THREADS - 1) // _ENGRAM_THREADS)
+    for t, i in jobs:
+        o = np.empty((len(i), t.shape[1]), dtype=t.dtype)
+        outs.append(o)
+        for a in range(0, len(i), per):
+            parts.append((t, i[a:a + per], o[a:a + per]))
+    list(_engram_pool.map(lambda p: np.take(p[0], p[1], axis=0, out=p[2]), parts))
+    return outs
 
 
 def engram_table_shards(folder: str) -> set[str]:
@@ -407,8 +438,10 @@ class DiskEngramEmbedding(nn.Module):
             # graph capture runs this once on dummy hashes (zero rows then);
             # real hashes are always in range
             flat = np.where(bad, 0, flat)
-        vals = self.files.rows(self.wname, flat).to(rows.device)
-        sc = self.files.rows(self.sname, flat).to(rows.device)
+        vals, sc = gather_rows([(self.files.table(self.wname), flat),
+                                (self.files.table(self.sname), flat)])
+        vals = torch.from_numpy(vals).to(rows.device)
+        sc = torch.from_numpy(sc).to(rows.device)
         v = vals.view(torch.float8_e4m3fn).float().unflatten(-1, (-1, self.block_size))
         v = (v * _e8m0(sc).unsqueeze(-1)).flatten(-2)
         if bad.any():

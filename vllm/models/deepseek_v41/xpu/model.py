@@ -93,6 +93,7 @@ _STREAM_GEMV_MAX_T = int(os.environ.get("VLLM_DS41_STREAM_GEMV_MAX_T", "16"))
 _LOOKAHEAD = int(os.environ.get("VLLM_DS41_LOOKAHEAD", "0"))
 _LOOKAHEAD_EXTRA = int(os.environ.get("VLLM_DS41_LOOKAHEAD_EXTRA", "2"))
 _ASYNC = os.environ.get("VLLM_DS41_STREAM_ASYNC", "1") == "1"
+_PF_OVERLAP = os.environ.get("VLLM_DS41_PF_OVERLAP", "1") == "1"
 _ASYNC_CHECK = os.environ.get("VLLM_DS41_STREAM_ASYNC_CHECK", "0") == "1"
 _ASYNC_STATS = {"n": 0, "miss": 0, "max": 0.0, "bad": 0}
 _STREAM_MOES: dict = {}  # layer id -> XpuOffloadMoE (main layers)
@@ -362,11 +363,15 @@ class XpuOffloadMoE(nn.Module):
         if not experts:
             return
         t1 = time.perf_counter() if tm else 0.0
+        gguf = cache.lay.get("format", "").startswith("ds41-gguf")
+        if x.shape[0] > _STREAM_GEMV_MAX_T and _PF_OVERLAP:
+            with prof.section("routed_moe_prefill"):
+                self._prefill_experts(x, idx, w, out, cache, experts, gguf)
+            return
         with prof.section("expert_fetch"):
             slot_row = cache.ensure(self.layer_id, experts)
         t2 = time.perf_counter() if tm else 0.0
         with prof.section("routed_moe"):
-            gguf = cache.lay.get("format", "").startswith("ds41-gguf")
             if x.shape[0] <= _STREAM_GEMV_MAX_T:
                 if gguf:
                     from .gguf_stream_moe import moe_decode_gguf as decode
@@ -381,17 +386,51 @@ class XpuOffloadMoE(nn.Module):
                     cache.note_timing(x.shape[0], t1 - t0, t2 - t1, t3 - t2,
                                       time.perf_counter() - t3)
                 return
+            self._prefill_experts(x, idx, w, out, cache, experts, gguf)
+
+    def _prefill_experts(self, x, idx, w, out, cache, experts, gguf) -> None:
+        """Many tokens: run each local expert on its tokens as soon as it is
+        resident (reads of the others continue meanwhile). The routing is
+        sorted once (one host transfer for the counts) instead of a
+        torch.where per expert, which made the host wait for the GPU each time."""
+        from .gguf_stream_moe import run_expert_gguf
+
+        k = idx.shape[1]
+        flat = idx.reshape(-1)
+        order = torch.argsort(flat, stable=True)
+        counts = torch.bincount(flat, minlength=self.e_start + self.n_local).tolist()
+        starts = [0] * len(counts)
+        acc = 0
+        for i, c in enumerate(counts):
+            starts[i] = acc
+            acc += c
+        wf = w.reshape(-1)
+        hit_set = {e for e in experts if (self.layer_id, e) in cache.lru}
+        done: set = set()
+
+        def run(e):
+            if e in done:
+                return
+            done.add(e)
+            n = counts[e]
+            if n == 0:
+                return
+            if e not in hit_set:
+                cache.wait_copies()
+            sel = order[starts[e]: starts[e] + n]
+            rows = torch.div(sel, k, rounding_mode="floor")
+            xs, ws = x[rows], wf[sel].unsqueeze(1)
             if gguf:
-                from .gguf_stream_moe import run_expert_gguf
-            for e in experts:
-                rows, slot = torch.where(idx == e)
-                if gguf:
-                    y = run_expert_gguf(x[rows], cache.pool, cache.lru[(self.layer_id, e)],
-                                        cache.lay, self.swiglu_limit, w[rows, slot, None])
-                else:
-                    y = run_expert(x[rows], cache.parts(self.layer_id, e), self.swiglu_limit,
-                                   w[rows, slot, None])
-                out.index_add_(0, rows, y)
+                y = run_expert_gguf(xs, cache.pool, cache.lru[(self.layer_id, e)], cache.lay,
+                                    self.swiglu_limit, ws)
+            else:
+                y = run_expert(xs, cache.parts(self.layer_id, e), self.swiglu_limit, ws)
+            out.index_add_(0, rows, y)
+
+        for e in cache.ensure_iter(self.layer_id, experts):
+            run(e)
+        for e in experts:  # all resident now; none may be skipped
+            run(e)
 
     def _check_async(self, x, idx, w, out, before, cache, decode, had_miss) -> None:
         """VLLM_DS41_STREAM_ASYNC_CHECK=1: redo the call the synchronous way
@@ -457,35 +496,60 @@ def _stream_moe(x, idx, w, out, moe) -> None:
 
 def _time_graph_replay() -> None:
     """VLLM_DS41_STREAM_TIMING=3: host time per breakable-graph replay, split
-    into graph-segment submits and eager segments (logged every 500 steps)."""
+    into graph-segment submits and eager segments by function, per graph
+    (segment count tells target and draft apart), plus the host time between
+    replays (sampling, drafting, scheduling). Logged every 500 replays."""
+    from collections import defaultdict
+
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture as C
 
     if getattr(C.replay, "_ds41_timed", False):
         return
-    st = [0, 0, 0.0, 0.0, 0.0]  # steps, segments, graph s, eager s, total s
+    names: dict = {}
+    st = {"n": 0, "gap": 0.0, "last": None}
+    per: dict = defaultdict(lambda: defaultdict(float))  # nseg -> name -> s (+ "#")
+
+    def name_of(r):
+        k = id(r)
+        if k not in names:
+            nm = "?"
+            for c in getattr(r, "__closure__", None) or ():
+                f = c.cell_contents
+                if callable(f) and hasattr(f, "__name__") and f.__name__ != "<lambda>":
+                    nm = f.__name__
+                    break
+            names[k] = nm
+        return names[k]
 
     def replay(self) -> None:
         t0 = time.perf_counter()
-        tg = te = 0.0
+        if st["last"] is not None:
+            st["gap"] += t0 - st["last"]
+        d_ = per[len(self.segments)]
         for r in self.segments:
             a = time.perf_counter()
             r()
             d = time.perf_counter() - a
             if getattr(r, "__self__", None) is not None:
-                tg += d
+                d_["graph submit"] += d
             else:
-                te += d
-        st[0] += 1
-        st[1] += len(self.segments)
-        st[2] += tg
-        st[3] += te
-        st[4] += time.perf_counter() - t0
-        if st[0] % 500 == 0:
-            n = st[0]
-            logger.info("graph replay: %d steps, %.1f segments/step, per step ms: "
-                        "graph submit %.2f, eager %.2f, total %.2f", n, st[1] / n,
-                        st[2] / n * 1e3, st[3] / n * 1e3, st[4] / n * 1e3)
-            st[:] = [0, 0, 0.0, 0.0, 0.0]
+                d_[name_of(r)] += d
+        d_["#"] += 1
+        d_["total"] += time.perf_counter() - t0
+        st["last"] = time.perf_counter()
+        st["n"] += 1
+        if st["n"] % 500 == 0:
+            n = st["n"]
+            parts = []
+            for nseg, d in sorted(per.items()):
+                c = d["#"]
+                parts.append("%d segs x%d: " % (nseg, c) + ", ".join(
+                    "%s %.2f" % (k, v / c * 1e3) for k, v in sorted(d.items(), key=lambda kv: -kv[1])
+                    if k != "#"))
+            logger.info("graph replay (ms per replay): %s; between replays %.2f ms",
+                        " | ".join(parts), st["gap"] / n * 1e3)
+            per.clear()
+            st["gap"] = 0.0
 
     replay._ds41_timed = True
     C.replay = replay
