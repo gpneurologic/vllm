@@ -196,6 +196,13 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
 
+    if os.environ.get("VLLM_DS41_ATTN_IN_GRAPH") == "1":
+        # Experiment: run the indexer and attention inside the graph segment
+        # (no eager break) for captured decode batches; correctness depends on
+        # the attention metadata living in fixed buffers between replays.
+        def _sparse_indexer_and_attn(self, *args, **kwargs):
+            return DeepseekV4Attention._sparse_indexer_and_attn.__wrapped__(self, *args, **kwargs)
+
     # ---------------------------------------------------------------- KV insert
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         cos_sin = self.rotary_emb.cos_sin_cache
