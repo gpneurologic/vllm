@@ -91,18 +91,22 @@ _STREAM_GEMV_MAX_T = int(os.environ.get("VLLM_DS41_STREAM_GEMV_MAX_T", "16"))
 # route the current MoE input and their predicted (not resident) experts are
 # queued as low-priority reads, so they overlap this layer's wait and compute.
 _LOOKAHEAD = int(os.environ.get("VLLM_DS41_LOOKAHEAD", "0"))
-# Experiment (quality trade): VLLM_DS41_SKIP_MISS=1 leaves a decode-step expert
-# that is not resident out of that step (weight 0, no renormalization) instead
-# of stalling every card at the next all-reduce while it is read; its read is
-# queued in the background so it is resident soon after. Prefill stays exact.
-_SKIP_MISS = os.environ.get("VLLM_DS41_SKIP_MISS", "0") == "1"
+# Skip missing experts in decode (default on, gated by _SKIP_MAX_FRAC below): a
+# decode-step expert that is not resident is left out of that step (weight 0, no
+# renormalization) instead of stalling every card at the next all-reduce while it
+# is read; its read is queued in the background so it is resident soon after.
+# Prefill stays exact. VLLM_DS41_SKIP_MISS=0 restores plain streaming (read every miss).
+# Gated default (2026-11-26): +22/+28/+34% decode at 1/2/4 chats, GSM8K 220 vs 219
+# on 250 questions. To re-test against plain streaming once there are more drives.
+_SKIP_MISS = os.environ.get("VLLM_DS41_SKIP_MISS", "1") == "1"
 # Test only: VLLM_DS41_DROP_PAIRS=p drops each routed (token, expert) pair of
 # streamed prefill steps with probability p (seeded), so the perplexity suite can
 # price the loss of a few percent of pairs. Not for serving.
 _DROP_PAIRS = float(os.environ.get("VLLM_DS41_DROP_PAIRS", "0") or 0)
-# With VLLM_DS41_SKIP_MISS=1: skip a missing expert only if every pair routed to it carries
-# less than this share of its token's routing weight (0 = skip every miss); heavier ones are read.
-_SKIP_MAX_FRAC = float(os.environ.get("VLLM_DS41_SKIP_MAX_FRAC", "0") or 0)
+# With skipping on: skip a missing expert only if every pair routed to it carries less
+# than this share of its token's routing weight (default 0.15; an even split is ~0.17);
+# heavier misses are read as before. 0 = skip every miss (full skip: -2 points GSM8K/500).
+_SKIP_MAX_FRAC = float(os.environ.get("VLLM_DS41_SKIP_MAX_FRAC", "0.15") or 0)
 _DROP_GEN: dict = {}
 _LOOKAHEAD_EXTRA = int(os.environ.get("VLLM_DS41_LOOKAHEAD_EXTRA", "2"))
 _ASYNC = os.environ.get("VLLM_DS41_STREAM_ASYNC", "1") == "1"
