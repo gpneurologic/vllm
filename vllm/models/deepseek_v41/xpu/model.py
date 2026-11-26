@@ -91,6 +91,19 @@ _STREAM_GEMV_MAX_T = int(os.environ.get("VLLM_DS41_STREAM_GEMV_MAX_T", "16"))
 # route the current MoE input and their predicted (not resident) experts are
 # queued as low-priority reads, so they overlap this layer's wait and compute.
 _LOOKAHEAD = int(os.environ.get("VLLM_DS41_LOOKAHEAD", "0"))
+# Experiment (quality trade): VLLM_DS41_SKIP_MISS=1 leaves a decode-step expert
+# that is not resident out of that step (weight 0, no renormalization) instead
+# of stalling every card at the next all-reduce while it is read; its read is
+# queued in the background so it is resident soon after. Prefill stays exact.
+_SKIP_MISS = os.environ.get("VLLM_DS41_SKIP_MISS", "0") == "1"
+# Test only: VLLM_DS41_DROP_PAIRS=p drops each routed (token, expert) pair of
+# streamed prefill steps with probability p (seeded), so the perplexity suite can
+# price the loss of a few percent of pairs. Not for serving.
+_DROP_PAIRS = float(os.environ.get("VLLM_DS41_DROP_PAIRS", "0") or 0)
+# With VLLM_DS41_SKIP_MISS=1: skip a missing expert only if every pair routed to it carries
+# less than this share of its token's routing weight (0 = skip every miss); heavier ones are read.
+_SKIP_MAX_FRAC = float(os.environ.get("VLLM_DS41_SKIP_MAX_FRAC", "0") or 0)
+_DROP_GEN: dict = {}
 _LOOKAHEAD_EXTRA = int(os.environ.get("VLLM_DS41_LOOKAHEAD_EXTRA", "2"))
 _ASYNC = os.environ.get("VLLM_DS41_STREAM_ASYNC", "1") == "1"
 _PF_OVERLAP = os.environ.get("VLLM_DS41_PF_OVERLAP", "1") == "1"
@@ -337,6 +350,12 @@ class XpuOffloadMoE(nn.Module):
         if _ASYNC and not nexts and T <= _STREAM_GEMV_MAX_T:
             self._forward_stream_async(x, idx, w, out, tm, t0)
             return
+        if _DROP_PAIRS > 0:
+            g = _DROP_GEN.get(x.device)
+            if g is None:
+                g = _DROP_GEN[x.device] = torch.Generator(device=x.device).manual_seed(1234)
+            keep = torch.rand(w.shape, generator=g, device=w.device) >= _DROP_PAIRS
+            w = w * keep.to(w.dtype)
         if nexts:
             # one host transfer for this layer's routing and the predictions
             kp = self.topk + _LOOKAHEAD_EXTRA
@@ -463,6 +482,11 @@ class XpuOffloadMoE(nn.Module):
         before = out.clone() if _ASYNC_CHECK else None
         hb = cache.idx_host(idx.numel(), idx.dtype)
         hb.copy_(idx.reshape(-1), non_blocking=True)
+        wb = None
+        if _SKIP_MISS and _SKIP_MAX_FRAC > 0:
+            wb = cache.idx_host(w.numel(), torch.float32, "_wh")
+            wf = w.float()
+            wb.copy_((wf / wf.sum(-1, keepdim=True).clamp_min(1e-20)).reshape(-1), non_blocking=True)
         ev = torch.xpu.Event()
         ev.record()
         with prof.section("routed_moe"):
@@ -476,6 +500,20 @@ class XpuOffloadMoE(nn.Module):
         miss: list = []
         if experts:
             miss = [e for e in experts if (self.layer_id, e) not in cache.lru]
+            if _SKIP_MISS and miss:
+                skip = miss
+                if wb is not None:
+                    ms = set(miss)
+                    frac: dict = {}
+                    for v, f in zip(hb.tolist(), wb.tolist()):
+                        if v in ms and f > frac.get(v, 0.0):
+                            frac[v] = f
+                    skip = [e for e in miss if frac.get(e, 0.0) < _SKIP_MAX_FRAC]
+                    cache.stats["skip_kept"] = cache.stats.get("skip_kept", 0) + len(miss) - len(skip)
+                if skip:
+                    cache.fetch_background([(self.layer_id, e) for e in skip])
+                    experts = [e for e in experts if e not in skip]
+                    miss = [e for e in miss if e not in skip]
             with prof.section("expert_fetch"):
                 cache.in_decode = True
                 cache.ensure(self.layer_id, experts)

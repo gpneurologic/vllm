@@ -196,12 +196,19 @@ class DeepseekV41XPUAttention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
 
-    if os.environ.get("VLLM_DS41_ATTN_IN_GRAPH") == "1":
+    if os.environ.get("VLLM_DS41_ATTN_IN_GRAPH") in ("1", "b1"):
         # Experiment: run the indexer and attention inside the graph segment
         # (no eager break) for captured decode batches; correctness depends on
         # the attention metadata living in fixed buffers between replays.
-        def _sparse_indexer_and_attn(self, *args, **kwargs):
-            return DeepseekV4Attention._sparse_indexer_and_attn.__wrapped__(self, *args, **kwargs)
+        # "1": every captured size (wrong with 4 parallel requests, 2026-11-25);
+        # "b1": only 1-token graphs (single request without DSpark), the rest break as usual.
+        _AIG_MAX = 1 << 30 if os.environ.get("VLLM_DS41_ATTN_IN_GRAPH") == "1" else 1
+
+        def _sparse_indexer_and_attn(self, hidden_states, *args, **kwargs):
+            if hidden_states.shape[0] <= self._AIG_MAX:
+                return DeepseekV4Attention._sparse_indexer_and_attn.__wrapped__(
+                    self, hidden_states, *args, **kwargs)
+            return DeepseekV4Attention._sparse_indexer_and_attn(self, hidden_states, *args, **kwargs)
 
     # ---------------------------------------------------------------- KV insert
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):

@@ -37,6 +37,7 @@ import heapq
 import json
 import mmap
 import os
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -51,6 +52,49 @@ STREAM_DIR = os.environ.get("VLLM_DS41_STREAM_DIR")
 # VLLM_DS41_STREAM_TIMING=1: host time per streamed MoE call (routing sync,
 # ensure, kernel launch); =2 also syncs after the kernel (GPU time; slower).
 TIMING = int(os.environ.get("VLLM_DS41_STREAM_TIMING", "0") or 0)
+
+
+_C_READER_SRC = r"""
+#define _GNU_SOURCE
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+/* Read n bytes at off (O_DIRECT, 4 KiB-rounded) into bounce, then copy them to dst.
+   Called through ctypes, so the whole piece runs without the Python GIL.
+   Returns 0, or -errno / -EIO on a short read. */
+int ds41_read_piece(int fd, long off, long n, char *bounce, char *dst) {
+    long want = (n + 4095) & ~4095L, got = 0;
+    while (got < want) {
+        ssize_t r = pread(fd, bounce + got, want - got, off + got);
+        if (r < 0) { if (errno == EINTR) continue; return -errno; }
+        if (r == 0) return -EIO;
+        got += r;
+    }
+    memcpy(dst, bounce, n);
+    return 0;
+}
+"""
+
+
+def _build_c_reader():
+    """Compile the GIL-free piece reader once per process (gcc in the image);
+    None if that fails (the Python reader is used then)."""
+    import subprocess
+    import tempfile
+    d = tempfile.mkdtemp(prefix="ds41_cread_")
+    src, so = os.path.join(d, "r.c"), os.path.join(d, "r.so")
+    try:
+        open(src, "w").write(_C_READER_SRC)
+        subprocess.run(["gcc", "-O2", "-shared", "-fPIC", "-o", so, src], check=True,
+                       capture_output=True, timeout=60)
+        lib = ctypes.CDLL(so)
+        fn = lib.ds41_read_piece
+        fn.argtypes = [ctypes.c_int, ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+        fn.restype = ctypes.c_int
+        return fn
+    except Exception as ex:  # noqa: BLE001
+        logger.warning("DeepSeek V4.1 stream: C reader unavailable (%s), using the Python reader", ex)
+        return None
 
 
 def enabled() -> bool:
@@ -130,6 +174,11 @@ class StreamCache:
             d, _, wt = m.rpartition(":")
             files.append((os.path.join(d, self.lay.get("file", "experts_fp4.bin")), int(wt)))
         self.fds = [os.open(p, os.O_RDONLY | os.O_DIRECT) for p, _ in files]
+        # Reader threads need the GIL after each read returns; the main thread holds it while it
+        # launches kernels and only hands it over every switch interval (default 5 ms).
+        si = os.environ.get("VLLM_DS41_SWITCH_INTERVAL")
+        if si:
+            sys.setswitchinterval(float(si))
         # expert index -> file: smooth weighted round-robin over the files
         # (weights 3,1 -> 0,0,1,0), so neighbouring experts use different drives
         wts = [wt for _, wt in files]
@@ -200,6 +249,9 @@ class StreamCache:
             self._sync_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._sync_mm))
             step = ((self.raw + 3) // 4 + 63) & ~63
             self._sync_jobs = [(o, min(step, self.raw - o)) for o in range(0, self.raw, step)]
+        # VLLM_DS41_C_READER=1: each piece is read and copied by one C call (no GIL
+        # between the read returning and the copy; see _C_READER_SRC).
+        self._cread = _build_c_reader() if os.environ.get("VLLM_DS41_C_READER") == "1" else None
         for _ in range(self.n_threads):
             threading.Thread(target=self._reader, daemon=True).start()
         logger.info("DeepSeek V4.1 expert streaming: %s, %d slots (%.1f per layer, %.1f GiB) "
@@ -247,6 +299,8 @@ class StreamCache:
         mm = mmap.mmap(-1, self.piece)
         mv = memoryview(mm)
         t = torch.frombuffer(mm, dtype=torch.uint8)
+        cread = self._cread
+        bounce = ctypes.addressof(ctypes.c_char.from_buffer(mm)) if cread is not None else 0
         while True:
             with self.qlock:
                 while not self.q:
@@ -269,15 +323,20 @@ class StreamCache:
                 # drives at once and the slower drive never straggles.
                 fd = self.fds[self.pattern[(k + gi) % len(self.pattern)]]
                 off = gi * self.block + p0
-                want = (n + 4095) & ~4095
-                got = 0
-                while got < want:
-                    r = os.preadv(fd, [mv[got:want]], off + got)
-                    if r <= 0:
-                        raise OSError(f"short read at expert {f.key}")
-                    got += r
-                with torch.inference_mode():  # the buffers were made in inference mode
-                    self.staging.bufs[f.buf][p0: p0 + n].copy_(t[:n])
+                if cread is not None:
+                    rc = cread(fd, off, n, bounce, self.staging.bufs[f.buf].data_ptr() + p0)
+                    if rc != 0:
+                        raise OSError(-rc, f"read failed at expert {f.key}")
+                else:
+                    want = (n + 4095) & ~4095
+                    got = 0
+                    while got < want:
+                        r = os.preadv(fd, [mv[got:want]], off + got)
+                        if r <= 0:
+                            raise OSError(f"short read at expert {f.key}")
+                        got += r
+                    with torch.inference_mode():  # the buffers were made in inference mode
+                        self.staging.bufs[f.buf][p0: p0 + n].copy_(t[:n])
             except Exception as ex:  # noqa: BLE001
                 f.err = ex
             with self.qlock:
@@ -531,16 +590,16 @@ class StreamCache:
                     self._row_to_dev(self.slot_dev[layer], self.slot_cpu[layer])
             self._dirty.clear()
 
-    def idx_host(self, n: int, dtype) -> torch.Tensor:
+    def idx_host(self, n: int, dtype, name: str = "_ih") -> torch.Tensor:
         """Pinned host buffer for a layer's routing ids (reused; callers wait
-        on the copy before the next use)."""
-        b = getattr(self, "_ih", None)
+        on the copy before the next use). `name` keeps separate buffers."""
+        b = getattr(self, name, None)
         if b is None or b.numel() < n or b.dtype != dtype:
             try:
                 b = torch.empty(max(n, 256), dtype=dtype, pin_memory=True)
             except RuntimeError:
                 b = torch.empty(max(n, 256), dtype=dtype)
-            self._ih = b
+            setattr(self, name, b)
         return b[:n]
 
     def fix_row(self, layer: int, experts: list[int]) -> torch.Tensor:
@@ -583,6 +642,21 @@ class StreamCache:
         for k, f in list(self.inflight.items()):
             if f.prio > 0 and f.done.is_set():
                 self._install(f, protect)
+
+    def fetch_background(self, keys: list[tuple[int, int]]) -> None:
+        """Queue reads without waiting (VLLM_DS41_SKIP_MISS): low priority, never
+        cancelled by prefetch(); installed by _flush_prefetched when landed, or
+        promoted if a demand read needs them first."""
+        # Buffers whose H2D copy finished sit in staging.pending until reclaimed; only get()
+        # reclaims, and skip mode issues no demand reads, so reclaim here (non-blocking).
+        with self.staging.cv:
+            self.staging._reclaim(block=False)
+        for k in keys:
+            self.stats["skipped"] = self.stats.get("skipped", 0) + 1
+            if k in self.lru or k in self.inflight or len(self.staging.free) <= 8:
+                continue
+            self._submit(k, 1)
+            self.stats["bg_issued"] = self.stats.get("bg_issued", 0) + 1
 
     def prefetch(self, keys: list[tuple[int, int]], prio: int = 1) -> None:
         """Queue low-priority reads (only into free staging buffers, keeping a
@@ -655,6 +729,10 @@ class StreamCache:
                     len(self.lru), 100.0 * s["hits"] / max(tot, 1), s["hits"], s["misses"],
                     s["pf_used"], s["pf_issued"], s["pf_dropped"], s["pf_hit"], s["pf_wasted"],
                     s["read_bytes"] / 2**30, s["wait_s"])
+        if s.get("skipped"):
+            logger.info("expert skip-miss: %d experts skipped in decode, %d background reads queued, "
+                        "%d heavy misses read instead (VLLM_DS41_SKIP_MAX_FRAC)",
+                        s["skipped"], s.get("bg_issued", 0), s.get("skip_kept", 0))
         if s.get("s_n"):
             n = s["s_n"]
             logger.info("expert sync read ms (decode, %d): read %.3f, staging + copy launch %.3f",
