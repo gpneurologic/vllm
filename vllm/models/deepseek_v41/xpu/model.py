@@ -91,14 +91,14 @@ _STREAM_GEMV_MAX_T = int(os.environ.get("VLLM_DS41_STREAM_GEMV_MAX_T", "16"))
 # route the current MoE input and their predicted (not resident) experts are
 # queued as low-priority reads, so they overlap this layer's wait and compute.
 _LOOKAHEAD = int(os.environ.get("VLLM_DS41_LOOKAHEAD", "0"))
-# Skip missing experts in decode (default on, gated by _SKIP_MAX_FRAC below): a
+# Skip missing experts in decode (VLLM_DS41_SKIP_MISS=1, gated by _SKIP_MAX_FRAC below): a
 # decode-step expert that is not resident is left out of that step (weight 0, no
 # renormalization) instead of stalling every card at the next all-reduce while it
 # is read; its read is queued in the background so it is resident soon after.
 # Prefill stays exact. VLLM_DS41_SKIP_MISS=0 restores plain streaming (read every miss).
-# Gated default (2026-11-26): +22/+28/+34% decode at 1/2/4 chats, GSM8K 220 vs 219
-# on 250 questions. To re-test against plain streaming once there are more drives.
-_SKIP_MISS = os.environ.get("VLLM_DS41_SKIP_MISS", "1") == "1"
+# Default off again (2026-11-26): on 500 GSM8K questions gated skip scored 430 vs 440 with
+# plain streaming (22 lost / 12 gained, p=0.12; first half p=0.03), the same as full skip.
+_SKIP_MISS = os.environ.get("VLLM_DS41_SKIP_MISS", "0") == "1"
 # Test only: VLLM_DS41_DROP_PAIRS=p drops each routed (token, expert) pair of
 # streamed prefill steps with probability p (seeded), so the perplexity suite can
 # price the loss of a few percent of pairs. Not for serving.
@@ -107,6 +107,23 @@ _DROP_PAIRS = float(os.environ.get("VLLM_DS41_DROP_PAIRS", "0") or 0)
 # than this share of its token's routing weight (default 0.15; an even split is ~0.17);
 # heavier misses are read as before. 0 = skip every miss (full skip: -2 points GSM8K/500).
 _SKIP_MAX_FRAC = float(os.environ.get("VLLM_DS41_SKIP_MAX_FRAC", "0.15") or 0)
+# Test only (plan Stage 0a): VLLM_DS41_NOWAIT=1 makes streamed decode launch its kernels on the
+# slot table and return: no routing sync, no reads, no installs (cache frozen after prefill).
+# Upper bound for removing the per-layer host waits; output quality is not meaningful.
+_NOWAIT = os.environ.get("VLLM_DS41_NOWAIT", "0") == "1"
+
+
+def _step_has_prefill() -> bool:
+    """True if the current step has prefill tokens (prefill chunk or mixed step):
+    missing experts must then be read, not skipped, or the skipped experts end up
+    in the KV cache of the prompt."""
+    md = get_forward_context().attn_metadata
+    if isinstance(md, dict):
+        for m in md.values():
+            n = getattr(m, "num_prefill_tokens", None)
+            if n is not None:
+                return n > 0
+    return False
 _DROP_GEN: dict = {}
 _LOOKAHEAD_EXTRA = int(os.environ.get("VLLM_DS41_LOOKAHEAD_EXTRA", "2"))
 _ASYNC = os.environ.get("VLLM_DS41_STREAM_ASYNC", "1") == "1"
@@ -482,12 +499,33 @@ class XpuOffloadMoE(nn.Module):
             from .gguf_stream_moe import moe_decode_gguf as decode
         else:
             from .fp4_moe import moe_decode_fp4 as decode
+        if _NOWAIT:
+            decode(x, idx, w, out, cache.pool, cache.slot_dev[self.layer_id], cache.lay,
+                   self.swiglu_limit)
+            return
+        if cache.step_mode and not _step_has_prefill():
+            # Plan v2 Stage 1-lite: no host wait in decode; misses are skipped this step and
+            # read in the background (stream.py "step mode").
+            ta = time.perf_counter()
+            cache.step_layer()
+            tb = time.perf_counter()
+            decode(x, idx, w, out, cache.pool, cache.slot_dev[self.layer_id], cache.lay,
+                   self.swiglu_limit)
+            tc = time.perf_counter()
+            cache.step_record(self.layer_id, idx, w, self.e_start, self.n_local)
+            st = cache.stats
+            st["st_n"] = st.get("st_n", 0) + 1
+            st["st_layer"] = st.get("st_layer", 0.0) + (tb - ta)
+            st["st_launch"] = st.get("st_launch", 0.0) + (tc - tb)
+            st["st_rec"] = st.get("st_rec", 0.0) + (time.perf_counter() - tc)
+            return
         cache.sync_table()
+        skip_ok = _SKIP_MISS and not _step_has_prefill()
         before = out.clone() if _ASYNC_CHECK else None
         hb = cache.idx_host(idx.numel(), idx.dtype)
         hb.copy_(idx.reshape(-1), non_blocking=True)
         wb = None
-        if _SKIP_MISS and _SKIP_MAX_FRAC > 0:
+        if skip_ok and _SKIP_MAX_FRAC > 0:
             wb = cache.idx_host(w.numel(), torch.float32, "_wh")
             wf = w.float()
             wb.copy_((wf / wf.sum(-1, keepdim=True).clamp_min(1e-20)).reshape(-1), non_blocking=True)
@@ -504,7 +542,9 @@ class XpuOffloadMoE(nn.Module):
         miss: list = []
         if experts:
             miss = [e for e in experts if (self.layer_id, e) not in cache.lru]
-            if _SKIP_MISS and miss:
+            if _SKIP_MISS and miss and not skip_ok:
+                cache.stats["skip_prefill_read"] = cache.stats.get("skip_prefill_read", 0) + len(miss)
+            if skip_ok and miss:
                 skip = miss
                 if wb is not None:
                     ms = set(miss)

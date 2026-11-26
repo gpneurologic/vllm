@@ -40,7 +40,7 @@ import os
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 import torch
 
@@ -207,6 +207,28 @@ class StreamCache:
         self.inflight: dict = {}                # (layer, e) -> _Fetch
         self._zombies: list = []                # cancelled fetches still holding a buffer
         self.copy_stream = torch.xpu.Stream(device)
+        # Step mode (VLLM_DS41_STEP_MISS=1, plan v2 Stage 1-lite): decode layers never wait
+        # for the host; see the "step mode" section below.
+        self.step_mode = os.environ.get("VLLM_DS41_STEP_MISS", "0") == "1"
+        self.step_noinstall = os.environ.get("VLLM_DS41_STEP_NOINSTALL", "0") == "1"
+        self.step_heavy = float(os.environ.get("VLLM_DS41_SKIP_MAX_FRAC", "0.15") or 0)
+        self.step_reserve = int(os.environ.get("VLLM_DS41_STEP_RESERVE", "8"))
+        self._owner = None
+        self._bad = None
+        if os.environ.get("VLLM_DS41_STEP_MISS_CHECK", "0") == "1":
+            self._owner = torch.full((n_slots,), -1, dtype=torch.int32, device=device)
+            self._bad = torch.zeros(1, dtype=torch.int32, device=device)
+        self._recs: list = []           # step-mode record groups
+        self._cur = None                # open record group
+        self.step_group = max(1, int(os.environ.get("VLLM_DS41_STEP_GROUP", "8")))
+        self._st_calls = 0
+        self._pending: deque = deque()  # records launched, not yet processed (launch order)
+        self._quar: deque = deque()     # (slot, event): evicted, free once the event completed
+        self._retry: deque = deque()    # (key, prio): background reads waiting for a staging buffer
+        self._rows2: list = []          # [pinned row, event or None]
+        self._landing: deque = deque()  # (key, slot, event): copy issued, table entry not yet
+        self._landing_keys: set = set()
+        self.step_twophase = os.environ.get("VLLM_DS41_STEP_TWOPHASE", "1") == "1"
         self.staging = _Staging(int(os.environ.get("VLLM_DS41_STAGING", "32")), self.block)
         self.n_threads = int(os.environ.get("VLLM_DS41_READ_THREADS", "16"))
         n_pc = max(1, int(os.environ.get("VLLM_DS41_READ_PIECES", "8")))
@@ -270,7 +292,7 @@ class StreamCache:
     # thread); ensure() never has more fetches in flight than buffers.
     class _Fetch:
         __slots__ = ("key", "prio", "round", "done", "buf", "err", "started", "cancel", "left",
-                     "installed", "t0", "t_start", "t_done")
+                     "installed", "t0", "t_start", "t_done", "bg")
 
         def __init__(self, key, prio, rnd, n):
             self.key, self.prio, self.round = key, prio, rnd
@@ -283,6 +305,7 @@ class StreamCache:
             self.installed = False
             self.t0 = time.perf_counter()
             self.t_start = self.t_done = 0.0
+            self.bg = False
 
     def _submit(self, key, prio: int):
         f = self._Fetch(key, prio, self.pf_round, len(self.pieces))
@@ -381,6 +404,8 @@ class StreamCache:
         src = self.staging.bufs[f.buf][: self.raw]
         with torch.xpu.stream(self.copy_stream):
             self.pool[slot].copy_(src, non_blocking=self.staging.pinned)
+            if self._owner is not None:
+                self._owner[slot].fill_(f.key[0] * self.E + f.key[1])
             ev = torch.xpu.Event()
             ev.record(self.copy_stream)
         if self.staging.pinned:
@@ -643,6 +668,206 @@ class StreamCache:
             if f.prio > 0 and f.done.is_set():
                 self._install(f, protect)
 
+    # ------------------------------------------------------------- step mode
+    # Decode MoE layers launch their kernels on the device slot table and a recorder kernel
+    # (step_miss.py) that writes which local experts were missing (largest routing-weight
+    # share of a pair that wanted them) and which were used; the result goes to pinned
+    # memory with an event. Nothing waits for the GPU. At the start of every step-mode layer
+    # (step_layer) the host processes the records whose event completed (LRU touch, reads
+    # for misses: priority 0 if heavy, 1 if light), installs landed reads into free slots
+    # and keeps a reserve of free slots by evicting LRU keys into quarantine.
+    # Safety without host waits:
+    # - eviction: the key's table entry is set to -1 on the compute stream, then an event is
+    #   recorded; kernels queued before it still read the intact slot, later ones skip it;
+    #   the slot is reused only after the event completed.
+    # - install: data copied on copy_stream into a free slot, the compute stream waits on
+    #   copy_stream, then the new table entry is written (stream-ordered).
+    # - table rows go through pinned buffers reused only after their copy's event.
+    def _row_push(self, layer: int) -> None:
+        for ent in self._rows2:
+            if ent[1] is None or ent[1].query():
+                break
+        else:
+            ent = [torch.empty(self.E, dtype=torch.int32, pin_memory=True), None]
+            self._rows2.append(ent)
+        ent[0].copy_(self.slot_cpu[layer])
+        self.slot_dev[layer].copy_(ent[0], non_blocking=True)
+        ev = torch.xpu.Event()
+        ev.record()
+        ent[1] = ev
+
+    def _rec_entry(self):
+        """A record group: G layers' records in one device buffer, cleared once, copied to
+        pinned memory with one event when the group closes (VLLM_DS41_STEP_GROUP, default 8)."""
+        for ent in self._recs:
+            if not ent["busy"]:
+                return ent
+        if len(self._recs) >= 64:  # host far ahead: wait for the oldest group (rare)
+            self._process_record(self._pending.popleft(), wait=True)
+            return self._rec_entry()
+        G, n = self.step_group, 2 * self.E
+        ent = {"dev": torch.zeros(G, n, dtype=torch.float32, device=self.device),
+               "host": torch.zeros(G, n, dtype=torch.float32, pin_memory=True),
+               "ev": None, "busy": False, "rows": []}
+        self._recs.append(ent)
+        return ent
+
+    def _close_group(self) -> None:
+        ent = self._cur
+        self._cur = None
+        if ent is None:
+            return
+        g = len(ent["rows"])
+        ent["host"][:g].copy_(ent["dev"][:g], non_blocking=True)
+        ev = torch.xpu.Event()
+        ev.record()
+        ent["ev"] = ev
+        self._pending.append(ent)
+
+    def step_record(self, layer: int, idx, w, lo: int, nl: int) -> None:
+        from .step_miss import record_misses
+
+        ent = self._cur
+        if ent is not None and ent["rows"] and layer <= ent["rows"][-1][0]:
+            self._close_group()  # a new step started before the group filled
+            ent = None
+        if ent is None:
+            ent = self._cur = self._rec_entry()
+            ent["busy"] = True
+            ent["rows"] = []
+            ent["dev"].zero_()
+        r = len(ent["rows"])
+        d = ent["dev"][r, : 2 * nl]
+        record_misses(idx, w, self.slot_dev[layer], lo, nl, d, self._owner, layer * self.E,
+                      self._bad)
+        ent["rows"].append((layer, lo, nl))
+        if len(ent["rows"]) >= self.step_group or layer == self.L - 1:
+            self._close_group()
+
+    def _process_record(self, ent, wait: bool = False) -> None:
+        if wait:
+            ent["ev"].synchronize()
+        st = self.stats
+        h = ent["host"]
+        for r, (layer, lo, nl) in enumerate(ent["rows"]):
+            used = torch.nonzero(h[r, nl: 2 * nl] > 0).flatten()  # ~6 per token, not all nl
+            shares = h[r, : nl][used].tolist()
+            for i, share in zip(used.tolist(), shares):
+                key = (layer, lo + i)
+                if key in self.lru:
+                    self.lru.move_to_end(key)
+                    st["hits"] += 1
+                    continue
+                st["skipped"] = st.get("skipped", 0) + 1
+                st["misses"] += 1
+                if self.step_noinstall or key in self.inflight or key in self._landing_keys:
+                    continue
+                heavy = share >= self.step_heavy
+                st["skip_heavy"] = st.get("skip_heavy", 0) + heavy
+                self._bg_submit(key, 0 if heavy else 1)
+        ent["busy"] = False
+
+    def _bg_submit(self, key, prio: int) -> None:
+        if len(self.staging.free) <= 4:
+            self._retry.append((key, prio))
+            self.stats["step_retry"] = self.stats.get("step_retry", 0) + 1
+            return
+        f = self._submit(key, prio)
+        f.bg = True
+        self.stats["bg_issued"] = self.stats.get("bg_issued", 0) + 1
+
+    def _evict_to_quarantine(self) -> bool:
+        for key in self.lru:
+            slot = self.lru.pop(key)
+            self.pf_keys.discard(key)
+            self.slot_cpu[key[0], key[1]] = -1
+            self._row_push(key[0])
+            ev = torch.xpu.Event()
+            ev.record()
+            self._quar.append((slot, ev))
+            self.stats["step_evict"] = self.stats.get("step_evict", 0) + 1
+            return True
+        return False
+
+    def step_layer(self) -> None:
+        """Host work at the start of a step-mode MoE layer; never waits for the GPU."""
+        self._st_calls += 1
+        if self._st_calls % 8 == 0 or len(self.staging.free) <= 8:
+            with self.staging.cv:
+                self.staging._reclaim(block=False)
+        while self._quar and self._quar[0][1].query():
+            self.free_slots.append(self._quar.popleft()[0])
+        done_layers = set()
+        while self._landing and self._landing[0][2].query():
+            key, slot, _ = self._landing.popleft()  # data complete: publish without a wait
+            self._landing_keys.discard(key)
+            if key in self.lru:  # the exact (prefill) path read it meanwhile: slot unused
+                self.free_slots.append(slot)
+                continue
+            self.lru[key] = slot
+            self.slot_cpu[key[0], key[1]] = slot
+            done_layers.add(key[0])
+        for layer in done_layers:
+            self._row_push(layer)
+        while self._pending and self._pending[0]["ev"].query():
+            self._process_record(self._pending.popleft())
+        n = len(self._retry)
+        while n and len(self.staging.free) > 4:
+            key, prio = self._retry.popleft()
+            n -= 1
+            if key not in self.lru and key not in self.inflight and key not in self._landing_keys:
+                f = self._submit(key, prio)
+                f.bg = True
+                self.stats["bg_issued"] = self.stats.get("bg_issued", 0) + 1
+        if self._zombies:
+            for z in [z for z in self._zombies if z.done.is_set()]:
+                self._zombies.remove(z)
+                self.staging.release(z.buf)
+        for layer in list(self._dirty):  # rows changed by the exact (prefill) path
+            self._row_push(layer)
+        self._dirty.clear()
+        landed = [f for f in self.inflight.values() if f.bg and f.done.is_set()]
+        new_layers = set()
+        for f in landed:
+            if not self.free_slots:
+                break
+            del self.inflight[f.key]
+            f.installed = True
+            if f.err is not None:
+                raise f.err
+            if f.cancel:
+                self.staging.release(f.buf)
+                continue
+            slot = self.free_slots.pop()
+            with torch.xpu.stream(self.copy_stream):
+                self.pool[slot].copy_(self.staging.bufs[f.buf][: self.raw],
+                                      non_blocking=self.staging.pinned)
+                if self._owner is not None:
+                    self._owner[slot].fill_(f.key[0] * self.E + f.key[1])
+                ev = torch.xpu.Event()
+                ev.record(self.copy_stream)
+            if self.staging.pinned:
+                self.staging.release_after(f.buf, ev)
+            else:
+                self.staging.release(f.buf)
+            self.stats["read_bytes"] += self.block
+            self.stats["step_install"] = self.stats.get("step_install", 0) + 1
+            if self.step_twophase:
+                self._landing.append((f.key, slot, ev))
+                self._landing_keys.add(f.key)
+                continue
+            self.lru[f.key] = slot
+            self.slot_cpu[f.key[0], f.key[1]] = slot
+            new_layers.add(f.key[0])
+        if new_layers:
+            torch.xpu.current_stream(self.device).wait_stream(self.copy_stream)
+            for layer in new_layers:
+                self._row_push(layer)
+        while len(self.free_slots) + len(self._quar) < self.step_reserve:
+            if not self._evict_to_quarantine():
+                break
+        self._maybe_log()
+
     def fetch_background(self, keys: list[tuple[int, int]]) -> None:
         """Queue reads without waiting (VLLM_DS41_SKIP_MISS): low priority, never
         cancelled by prefetch(); installed by _flush_prefetched when landed, or
@@ -729,10 +954,24 @@ class StreamCache:
                     len(self.lru), 100.0 * s["hits"] / max(tot, 1), s["hits"], s["misses"],
                     s["pf_used"], s["pf_issued"], s["pf_dropped"], s["pf_hit"], s["pf_wasted"],
                     s["read_bytes"] / 2**30, s["wait_s"])
+        if s.get("st_n"):
+            n = s["st_n"]
+            logger.info("expert step mode host ms per layer: housekeeping %.3f, kernel launch %.3f, "
+                        "recorder %.3f (%d calls)", 1e3 * s["st_layer"] / n, 1e3 * s["st_launch"] / n,
+                        1e3 * s["st_rec"] / n, n)
+        if self.step_mode and s.get("bg_issued") is not None:
+            bad = int(self._bad.item()) if self._bad is not None else -1
+            logger.info("expert step mode: %d misses skipped (%d heavy), %d reads, %d installs, "
+                        "%d evictions, %d retries, quarantine %d, free %d, pending records %d, "
+                        "owner-tag mismatches %d", s.get("skipped", 0), s.get("skip_heavy", 0),
+                        s.get("bg_issued", 0), s.get("step_install", 0), s.get("step_evict", 0),
+                        s.get("step_retry", 0), len(self._quar), len(self.free_slots),
+                        len(self._pending), bad)
         if s.get("skipped"):
             logger.info("expert skip-miss: %d experts skipped in decode, %d background reads queued, "
-                        "%d heavy misses read instead (VLLM_DS41_SKIP_MAX_FRAC)",
-                        s["skipped"], s.get("bg_issued", 0), s.get("skip_kept", 0))
+                        "%d heavy misses read instead (VLLM_DS41_SKIP_MAX_FRAC), %d read in short prefill steps",
+                        s["skipped"], s.get("bg_issued", 0), s.get("skip_kept", 0),
+                        s.get("skip_prefill_read", 0))
         if s.get("s_n"):
             n = s["s_n"]
             logger.info("expert sync read ms (decode, %d): read %.3f, staging + copy launch %.3f",
