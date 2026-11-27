@@ -339,6 +339,13 @@ class DeepseekV41ForCausalLM(
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """Checkpoint tensors no XPU build loads, skipped by the loader before they are read:
+        routed experts (streamed from their own file, or from the GGUF) and Engram tables (read
+        at run time). Vision weights and the rest are kept. Avoids reading ~280 GiB per start."""
+        return ((".experts." in name and ".shared_experts." not in name)
+                or ".engram.embed_tokens." in name or ".engram.embed." in name)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(self.hf_to_vllm_mapper.apply(weights))

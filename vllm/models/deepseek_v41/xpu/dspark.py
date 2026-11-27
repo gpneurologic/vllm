@@ -179,6 +179,11 @@ class DSparkDeepseekV4Model(nn.Module):
 class DSparkDeepseekV4ForCausalLM(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """Only the mtp.* draft blocks are loaded (embedding and LM head come from the target);
+        the loader skips everything else before reading it (see _remap)."""
+        return not name.startswith("mtp.")
     draft_id_to_target_id = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

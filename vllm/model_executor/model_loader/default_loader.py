@@ -354,6 +354,7 @@ class DefaultModelLoader(BaseModelLoader):
                         shuffle_safetensors_files=(
                             self.load_config.shuffle_safetensors_files
                         ),
+                        skip_fn=source.is_unused_weight,
                     )
         else:
             if extra_config.get("enable_multithread_load"):

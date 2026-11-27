@@ -1067,8 +1067,13 @@ def safetensors_weights_iterator(
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
     shuffle_safetensors_files: bool = False,
+    skip_fn: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
+
+    *skip_fn* (the model's ``is_unused_checkpoint_weight``) is checked before a
+    tensor is read, so a model that loads only part of a checkpoint (e.g. experts
+    streamed from another file) does not read the rest from disk.
 
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
@@ -1158,7 +1163,9 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
+                if not should_skip_weight(name, local_expert_ids) and not (
+                    skip_fn is not None and skip_fn(name)
+                ):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -1194,6 +1201,8 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
+                        continue
+                    if skip_fn is not None and skip_fn(name):
                         continue
                     param = f.get_tensor(name)
                     yield name, param

@@ -1104,6 +1104,15 @@ class DeepseekV41LLMForCausalLM(nn.Module, SupportsPP):
     def get_mtp_target_hidden_states(self):
         return None
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """Checkpoint tensors this model never loads, skipped by the loader before they are
+        read: routed experts (streamed, or from the GGUF) and Engram tables (read at run time).
+        Same rule as DeepseekV4Model.load_weights; avoids reading ~280 GiB at every start."""
+        return ((".experts." in name and ".shared_experts." not in name)
+                or ".engram.embed_tokens." in name or ".engram.embed." in name
+                or name.endswith(".bias_vl")
+                or name.startswith(("vision.", "aligner.", "image_")))
+
     def load_weights(self, weights):
         return AutoWeightsLoader(self).load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
