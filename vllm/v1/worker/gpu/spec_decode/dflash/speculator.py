@@ -36,6 +36,12 @@ from vllm.v1.worker.utils import AttentionGroup, groups_with_metadata_builders
 logger = init_logger(__name__)
 
 
+
+# VLLM_DS41_DRAFT_FULL_GRAPH=1: capture the draft step as a FULL graph even when the target uses
+# PIECEWISE graphs (the DeepSeek V4.1 XPU streaming build needs PIECEWISE for its eager breaks);
+# without it the draft runs eagerly, about 11 ms of host time per step.
+_DRAFT_FULL_GRAPH = __import__("os").environ.get("VLLM_DS41_DRAFT_FULL_GRAPH", "0") == "1"
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -103,7 +109,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         if (
             aux_layers
-            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and (cudagraph_mode.decode_mode() == CUDAGraphMode.FULL or _DRAFT_FULL_GRAPH)
             and not self.context_kv_only
         ):
             self._aux_staging = torch.zeros(
@@ -148,7 +154,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = (
-            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            (cudagraph_mode.decode_mode() == CUDAGraphMode.FULL or _DRAFT_FULL_GRAPH)
             and not self.context_kv_only
         )
         supports_full = (

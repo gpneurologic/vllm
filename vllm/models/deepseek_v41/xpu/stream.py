@@ -209,7 +209,10 @@ class StreamCache:
         self.copy_stream = torch.xpu.Stream(device)
         # Step mode (VLLM_DS41_STEP_MISS=1, plan v2 Stage 1-lite): decode layers never wait
         # for the host; see the "step mode" section below.
-        self.step_mode = os.environ.get("VLLM_DS41_STEP_MISS", "0") == "1"
+        # Default on since 2026-11-27 (30-min stress test clean, owner tags 0; +10% over full skip,
+        # makes DSpark pay: 32.2 vs 24.5 tok/s). Only with skipping on (VLLM_DS41_SKIP_MISS=0 = plain).
+        self.step_mode = (os.environ.get("VLLM_DS41_STEP_MISS", "1") == "1"
+                          and os.environ.get("VLLM_DS41_SKIP_MISS", "1") == "1")
         self.step_noinstall = os.environ.get("VLLM_DS41_STEP_NOINSTALL", "0") == "1"
         self.step_heavy = float(os.environ.get("VLLM_DS41_SKIP_MAX_FRAC", "0.15") or 0)
         self.step_reserve = int(os.environ.get("VLLM_DS41_STEP_RESERVE", "8"))
@@ -230,10 +233,22 @@ class StreamCache:
         self._landing_keys: set = set()
         self.step_twophase = os.environ.get("VLLM_DS41_STEP_TWOPHASE", "1") == "1"
         self.staging = _Staging(int(os.environ.get("VLLM_DS41_STAGING", "32")), self.block)
-        self.n_threads = int(os.environ.get("VLLM_DS41_READ_THREADS", "16"))
+        # Plain streaming waits on its reads and wants many threads (16: 17.7 vs 17.0 tok/s at 4);
+        # skip/step modes read in the background, where fewer threads mean less CPU contention
+        # on the 8 cores (full skip 24.3 -> 26.4 tok/s at 4). With background reads in 2 pieces,
+        # 8 threads keep decode (28.1 vs 28.9 at 4) and give the best prefill (423/373/375 tok/s).
+        bg_reads = self.step_mode or os.environ.get("VLLM_DS41_SKIP_MISS", "1") == "1"
+        self.n_threads = int(os.environ.get("VLLM_DS41_READ_THREADS", "8" if bg_reads else "16"))
         n_pc = max(1, int(os.environ.get("VLLM_DS41_READ_PIECES", "8")))
         self.piece = ((self.raw + n_pc - 1) // n_pc + 4095) & ~4095
         self.pieces = [(p, min(self.piece, self.raw - p)) for p in range(0, self.raw, self.piece)]
+        # Background reads (skip / step mode) use fewer, larger pieces, so a decode-time read
+        # keeps only a few reader threads busy (less CPU contention with the host) while
+        # demand reads (prefill) still spread over all threads (VLLM_DS41_BG_PIECES).
+        n_bg = max(1, int(os.environ.get("VLLM_DS41_BG_PIECES", "2")))  # 8 threads x 2: best mix
+        self.bg_piece = ((self.raw + n_bg - 1) // n_bg + 4095) & ~4095
+        self.bg_pieces = [(p, min(self.bg_piece, self.raw - p))
+                          for p in range(0, self.raw, self.bg_piece)]
         self.q: list = []                       # heap of (prio, seq, fetch, piece)
         self.qlock = threading.Condition()
         self.done_cv = threading.Condition()     # readers notify on each finished fetch
@@ -292,7 +307,7 @@ class StreamCache:
     # thread); ensure() never has more fetches in flight than buffers.
     class _Fetch:
         __slots__ = ("key", "prio", "round", "done", "buf", "err", "started", "cancel", "left",
-                     "installed", "t0", "t_start", "t_done", "bg")
+                     "installed", "t0", "t_start", "t_done", "bg", "pcs")
 
         def __init__(self, key, prio, rnd, n):
             self.key, self.prio, self.round = key, prio, rnd
@@ -306,12 +321,16 @@ class StreamCache:
             self.t0 = time.perf_counter()
             self.t_start = self.t_done = 0.0
             self.bg = False
+            self.pcs = None
 
-    def _submit(self, key, prio: int):
-        f = self._Fetch(key, prio, self.pf_round, len(self.pieces))
+    def _submit(self, key, prio: int, bg: bool = False):
+        pcs = self.bg_pieces if bg else self.pieces
+        f = self._Fetch(key, prio, self.pf_round, len(pcs))
+        f.pcs = pcs
+        f.bg = bg
         f.buf = self.staging.get()
         with self.qlock:
-            for k in range(len(self.pieces)):
+            for k in range(len(pcs)):
                 self.seq += 1
                 heapq.heappush(self.q, (prio, self.seq, f, k))
             self.qlock.notify_all()
@@ -319,7 +338,7 @@ class StreamCache:
         return f
 
     def _reader(self) -> None:
-        mm = mmap.mmap(-1, self.piece)
+        mm = mmap.mmap(-1, max(self.piece, self.bg_piece))
         mv = memoryview(mm)
         t = torch.frombuffer(mm, dtype=torch.uint8)
         cread = self._cread
@@ -338,7 +357,7 @@ class StreamCache:
                     f.t_start = time.perf_counter()
                 f.started = True
             try:
-                p0, n = self.pieces[k]
+                p0, n = f.pcs[k]
                 l, e = f.key
                 gi = l * self.E + e
                 # Stripe within the expert: its pieces are spread over the
@@ -772,8 +791,7 @@ class StreamCache:
             self._retry.append((key, prio))
             self.stats["step_retry"] = self.stats.get("step_retry", 0) + 1
             return
-        f = self._submit(key, prio)
-        f.bg = True
+        self._submit(key, prio, bg=True)
         self.stats["bg_issued"] = self.stats.get("bg_issued", 0) + 1
 
     def _evict_to_quarantine(self) -> bool:
@@ -816,8 +834,7 @@ class StreamCache:
             key, prio = self._retry.popleft()
             n -= 1
             if key not in self.lru and key not in self.inflight and key not in self._landing_keys:
-                f = self._submit(key, prio)
-                f.bg = True
+                self._submit(key, prio, bg=True)
                 self.stats["bg_issued"] = self.stats.get("bg_issued", 0) + 1
         if self._zombies:
             for z in [z for z in self._zombies if z.done.is_set()]:

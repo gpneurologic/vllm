@@ -96,17 +96,18 @@ _LOOKAHEAD = int(os.environ.get("VLLM_DS41_LOOKAHEAD", "0"))
 # renormalization) instead of stalling every card at the next all-reduce while it
 # is read; its read is queued in the background so it is resident soon after.
 # Prefill stays exact. VLLM_DS41_SKIP_MISS=0 restores plain streaming (read every miss).
-# Default off again (2026-11-26): on 500 GSM8K questions gated skip scored 430 vs 440 with
-# plain streaming (22 lost / 12 gained, p=0.12; first half p=0.03), the same as full skip.
-_SKIP_MISS = os.environ.get("VLLM_DS41_SKIP_MISS", "0") == "1"
+# On 500 GSM8K questions every skip mode (full, gated, step mode) scored 430 vs 440 with plain
+# streaming; the user chose speed (2026-11-27): full skip is the default (fastest proven mode,
+# +8-30% decode). VLLM_DS41_SKIP_MISS=0 restores plain streaming.
+_SKIP_MISS = os.environ.get("VLLM_DS41_SKIP_MISS", "1") == "1"
 # Test only: VLLM_DS41_DROP_PAIRS=p drops each routed (token, expert) pair of
 # streamed prefill steps with probability p (seeded), so the perplexity suite can
 # price the loss of a few percent of pairs. Not for serving.
 _DROP_PAIRS = float(os.environ.get("VLLM_DS41_DROP_PAIRS", "0") or 0)
 # With skipping on: skip a missing expert only if every pair routed to it carries less
-# than this share of its token's routing weight (default 0.15; an even split is ~0.17);
+# than this share of its token's routing weight (default 0 = full skip; 0.15 gave no quality gain);
 # heavier misses are read as before. 0 = skip every miss (full skip: -2 points GSM8K/500).
-_SKIP_MAX_FRAC = float(os.environ.get("VLLM_DS41_SKIP_MAX_FRAC", "0.15") or 0)
+_SKIP_MAX_FRAC = float(os.environ.get("VLLM_DS41_SKIP_MAX_FRAC", "0") or 0)
 # Test only (plan Stage 0a): VLLM_DS41_NOWAIT=1 makes streamed decode launch its kernels on the
 # slot table and return: no routing sync, no reads, no installs (cache frozen after prefill).
 # Upper bound for removing the per-layer host waits; output quality is not meaningful.

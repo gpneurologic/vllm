@@ -362,3 +362,56 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                             "confidence_head.")):
             return f"model.{rest}"
         return f"model.layers.{stage}.{rest}"
+
+
+# --- VLLM_DS41_DSPARK_TIMING=1: host and GPU time of the DSpark speculator per step -------------
+def _install_dspark_timing() -> None:
+    """Wrap DSparkSpeculator.propose / _generate_draft with host timers and XPU timing events;
+    log averages every 30 s (rank 0). Events are resolved 64 calls later (long finished)."""
+    import os as _os
+    import time as _time
+
+    from vllm.v1.worker.gpu.spec_decode.dspark import speculator as _sp
+
+    cls = _sp.DSparkSpeculator
+    st: dict = {}
+    last = [_time.time()]
+
+    def wrap(name):
+        orig = getattr(cls, name)
+
+        def timed(self, *a, **k):
+            t0 = _time.perf_counter()
+            e0 = torch.xpu.Event(enable_timing=True)
+            e0.record()
+            r = orig(self, *a, **k)
+            e1 = torch.xpu.Event(enable_timing=True)
+            e1.record()
+            s = st.setdefault(name, {"n": 0, "host": 0.0, "gpu": 0.0, "ng": 0, "q": []})
+            s["n"] += 1
+            s["host"] += _time.perf_counter() - t0
+            s["q"].append((e0, e1))
+            while len(s["q"]) > 64:
+                a0, a1 = s["q"].pop(0)
+                a1.synchronize()
+                s["gpu"] += a0.elapsed_time(a1) / 1e3
+                s["ng"] += 1
+            if _time.time() - last[0] > 30:
+                last[0] = _time.time()
+                logger.info("DSpark timing: %s", ", ".join(
+                    f"{k} {v['n']} calls host {1e3 * v['host'] / max(v['n'], 1):.2f} ms "
+                    f"gpu {1e3 * v['gpu'] / max(v['ng'], 1):.2f} ms" for k, v in st.items()))
+            return r
+
+        setattr(cls, name, timed)
+
+    for name in ("propose", "_generate_draft"):
+        if hasattr(cls, name):
+            wrap(name)
+
+
+if __import__("os").environ.get("VLLM_DS41_DSPARK_TIMING") == "1":
+    try:
+        _install_dspark_timing()
+    except Exception as _ex:  # noqa: BLE001
+        logger.warning("DSpark timing not installed: %s", _ex)
